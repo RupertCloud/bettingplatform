@@ -11,11 +11,8 @@ export type Client = pg.PoolClient;
 /** One pool per service; every connection uses that service's own schema. */
 export const createPool = (connectionString: string, schema: string): Pool => {
   if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error(`Bad schema name: ${schema}`);
-  const pool = new pg.Pool({ connectionString, max: 20 });
-  pool.on('connect', (client) => {
-    void client.query(`SET search_path TO ${schema}`);
-  });
-  return pool;
+  // Set at connection start-up, so no query can run before it applies.
+  return new pg.Pool({ connectionString, max: 20, options: `-c search_path=${schema}` });
 };
 
 const RETRYABLE = new Set(['40001', '40P01']); // serialization failure, deadlock
