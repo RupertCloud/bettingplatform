@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   AppError, lineCount, withTx,
   type BetRecord, type BetStore, type Client, type Currency, type Ledger, type LegOutcome,
-  type Minor, type OperatorAccountKind, type Pool, type PostingLine, type SelectionResult,
+  type Minor, type OperatorAccountKind, type Pool, type PostingLine, type RgGate, type SelectionResult,
 } from '@bp/common';
 import { betReturn, validateDeadHeat, type DeadHeat, type GradedLeg } from './grading.js';
 
@@ -15,6 +15,8 @@ export interface SettlementDeps {
   pool: Pool;
   bets: BetStore;
   ledger: Ledger;
+  /** Told what each bet staked and returned, so loss limits net out wins (FR-RG-002). */
+  rg: Pick<RgGate, 'recordSettlement'>;
   now?: () => Date;
   /** Licence jurisdiction passed to the tax policy, default 'CM'. BetRecord carries no jurisdiction yet. */
   jurisdiction?: string;
@@ -222,6 +224,7 @@ export class Settlement {
   private readonly pool: Pool;
   private readonly bets: BetStore;
   private readonly ledger: Ledger;
+  private readonly rg: Pick<RgGate, 'recordSettlement'>;
   private readonly now: () => Date;
   private readonly jurisdiction: string;
   private readonly taxPolicy: TaxPolicy;
@@ -232,6 +235,7 @@ export class Settlement {
     this.pool = deps.pool;
     this.bets = deps.bets;
     this.ledger = deps.ledger;
+    this.rg = deps.rg;
     this.now = deps.now ?? (() => new Date());
     this.jurisdiction = deps.jurisdiction ?? 'CM';
     this.taxPolicy = deps.taxPolicy ?? (() => 0n);
@@ -638,6 +642,11 @@ export class Settlement {
           "UPDATE settlements SET status = 'POSTED', ledger_entry_id = $3, posted_at = $4 WHERE bet_id = $1 AND version = $2",
           [bet.betId, version, entry.entryId, this.now()],
         );
+        // Idempotent per bet, so a retry after a crash here records it once.
+        // Known gap: resettlements do not adjust the RG figure.
+        if (row.kind === 'SETTLE') {
+          await this.rg.recordSettlement(row.player_id, row.currency, row.total_stake, row.delta_net, `bet:${bet.betId}`, this.now());
+        }
         return done;
       } catch (err) {
         if (!(err instanceof AppError && err.code === 'insufficient_funds')) throw err;

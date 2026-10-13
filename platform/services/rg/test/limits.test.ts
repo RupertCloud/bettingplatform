@@ -87,6 +87,21 @@ describe('limits', () => {
     expect(await h.rg.checkStake(p, 'XAF', 2_000n, t)).toEqual({ allowed: true });
   });
 
+  it('FR-RG-002 a released stake stops counting and its ref cannot be reused', async () => {
+    const p = h.addPlayer();
+    await h.rg.setLimit(p, 'STAKE_DAY', 10_000n);
+    const t = h.clock.now();
+    expect(await h.rg.checkAndRecordStake(p, 'XAF', 8_000n, 'r1', t)).toEqual({ allowed: true });
+    expect(await h.rg.checkStake(p, 'XAF', 8_000n, t)).toMatchObject({ allowed: false, code: 'stake_limit_exceeded' });
+    // The bet was refused after recording (e.g. insufficient funds): the stake was never taken.
+    await h.rg.releaseStake(p, 'XAF', 8_000n, 'r1', t);
+    expect(await h.rg.checkStake(p, 'XAF', 8_000n, t)).toEqual({ allowed: true });
+    expect(await h.rg.checkAndRecordStake(p, 'XAF', 8_000n, 'r1', t)).toMatchObject({ code: 'reference_declined' });
+    // Releasing twice is a no-op.
+    await h.rg.releaseStake(p, 'XAF', 8_000n, 'r1', t);
+    expect(await h.rg.checkAndRecordStake(p, 'XAF', 10_000n, 'r2', t)).toEqual({ allowed: true });
+  });
+
   it('FR-RG-002 session time limit blocks stakes once reached', async () => {
     const p = h.addPlayer();
     await h.rg.setLimit(p, 'SESSION_MINUTES', 30n);

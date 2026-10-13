@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppError, testDb } from '@bp/common';
 import { buildServer, Settlement, type Identity } from '../src/index.js';
-import { FakeBetStore, FakeLedger, makeBet } from './fakes.js';
+import { FakeBetStore, FakeLedger, FakeRg, makeBet } from './fakes.js';
 
 const MIGRATIONS = fileURLToPath(new URL('../migrations', import.meta.url));
 
@@ -24,7 +24,7 @@ const ledger = new FakeLedger();
 
 beforeAll(async () => {
   db = await testDb('settlement', MIGRATIONS);
-  svc = new Settlement({ pool: db.pool, bets, ledger, now: () => new Date('2026-10-01T18:00:00Z'), approvalThresholds: { XAF: 5_000n } });
+  svc = new Settlement({ pool: db.pool, bets, ledger, rg: new FakeRg(), now: () => new Date('2026-10-01T18:00:00Z'), approvalThresholds: { XAF: 5_000n } });
   app = buildServer({
     settlement: svc,
     authenticate: async (req) => {

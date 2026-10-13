@@ -85,7 +85,7 @@ export const setup = async (): Promise<Harness> => {
     },
     sleep: (ms) => hooks.duringInPlayDelay(ms),
   });
-  const settlement = new Settlement({ pool: dbs.settlement.pool, bets: betting, ledger: wallet, now });
+  const settlement = new Settlement({ pool: dbs.settlement.pool, bets: betting, ledger: wallet, rg, now });
 
   return {
     pools: {

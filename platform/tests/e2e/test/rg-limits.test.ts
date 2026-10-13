@@ -1,6 +1,5 @@
-// Contract gap found while wiring the services: the RgGate port only has checkStake, so
-// betting never records stakes with rg and settlement never records returns. Period stake
-// and loss limits (FR-RG-002) therefore never accumulate across bets in the integrated system.
+// Period stake and loss limits (FR-RG-002) must accumulate across bets: betting records each
+// stake with rg when the bet opens, and settlement records what it returned.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   betRequest,
@@ -37,9 +36,7 @@ describe('responsible gambling period limits across services', () => {
     expect(await h.wallet.balance(cash(playerId))).toBe(50_000n);
   });
 
-  // Confirmed contract mismatch (see commit body): BettingService calls RgGate.checkStake and never
-  // records the stake, so rg's daily stake sum stays 0 and the second bet is accepted.
-  it.fails('FR-RG-002 FR-BET-003: a daily stake limit counts stakes already placed today', async () => {
+  it('FR-RG-002 FR-BET-003: a daily stake limit counts stakes already placed today', async () => {
     const playerId = await registerActivePlayer(h);
     await deposit(h, playerId, 50_000n);
     const [fixture] = await ingestFixtures(h, [

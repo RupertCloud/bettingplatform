@@ -143,7 +143,14 @@ export interface RgDeps {
 
 export type PaymentMethod = 'CREDIT_CARD' | 'DEBIT_CARD' | 'MOBILE_MONEY' | 'BANK_TRANSFER' | 'E_WALLET' | 'CRYPTO';
 
-type ActivityKind = 'DEPOSIT' | 'DEPOSIT_DECLINED' | 'STAKE' | 'SETTLEMENT' | 'WITHDRAWAL' | 'WITHDRAWAL_CANCELLED';
+type ActivityKind =
+  | 'DEPOSIT'
+  | 'DEPOSIT_DECLINED'
+  | 'STAKE'
+  | 'STAKE_RELEASED'
+  | 'SETTLEMENT'
+  | 'WITHDRAWAL'
+  | 'WITHDRAWAL_CANCELLED';
 
 // ---------- Helpers ----------
 
@@ -223,9 +230,11 @@ const windowSums = async (c: Client, playerId: PlayerId, currency: Currency, at:
        SELECT kind, amount, occurred_at FROM activity x
         WHERE x.player_id = $1 AND x.currency = $2
           AND x.occurred_at > $3::timestamptz - interval '30 days' AND x.occurred_at <= $3::timestamptz
-          AND NOT (x.kind IN ('DEPOSIT', 'WITHDRAWAL') AND EXISTS (
+          AND NOT (x.kind IN ('DEPOSIT', 'WITHDRAWAL', 'STAKE') AND EXISTS (
                 SELECT 1 FROM activity d WHERE d.player_id = x.player_id AND d.ref = x.ref
-                   AND d.kind = CASE x.kind WHEN 'DEPOSIT' THEN 'DEPOSIT_DECLINED' ELSE 'WITHDRAWAL_CANCELLED' END))
+                   AND d.kind = CASE x.kind WHEN 'DEPOSIT' THEN 'DEPOSIT_DECLINED'
+                                            WHEN 'STAKE' THEN 'STAKE_RELEASED'
+                                            ELSE 'WITHDRAWAL_CANCELLED' END))
      )
      SELECT
        COALESCE(SUM(amount) FILTER (WHERE kind = 'DEPOSIT' AND occurred_at > $3::timestamptz - interval '1 day'), 0)::bigint AS dep_day,
@@ -587,6 +596,10 @@ export class ResponsibleGambling implements RgGate {
   recordStake(playerId: PlayerId, currency: Currency, stake: Minor, ref: string, at: Date): Promise<boolean> {
     return this.record('STAKE', playerId, currency, stake, ref, at);
   }
+  /** The bet recorded under ref was refused after recording; its stake stops counting toward limits. */
+  releaseStake(playerId: PlayerId, currency: Currency, stake: Minor, ref: string, at: Date): Promise<boolean> {
+    return this.record('STAKE_RELEASED', playerId, currency, stake, ref, at);
+  }
   /** Settlement of a bet: what was staked and what was returned (0 for a loss, stake for a void). */
   recordSettlement(playerId: PlayerId, currency: Currency, stake: Minor, returned: Minor, ref: string, at: Date): Promise<boolean> {
     if (typeof stake !== 'bigint' || stake < 0n) throw new AppError('invalid_amount', 400, 'Stake must not be negative');
@@ -685,13 +698,14 @@ export class ResponsibleGambling implements RgGate {
     return withTx(this.pool, async (c) => {
       await lockPlayer(c, playerId);
       if (ref !== null) {
+        const spent = kind === 'DEPOSIT' ? 'DEPOSIT_DECLINED' : 'STAKE_RELEASED';
         const seen = await c.query<{ kind: string }>(
           'SELECT kind FROM activity WHERE player_id = $1 AND kind IN ($2, $3) AND ref = $4',
-          [playerId, kind, 'DEPOSIT_DECLINED', ref],
+          [playerId, kind, spent, ref],
         );
-        // A declined deposit's ref is spent: a retry under it would never count toward limits.
-        if (kind === 'DEPOSIT' && seen.rows.some((r) => r.kind === 'DEPOSIT_DECLINED')) {
-          return deny('reference_declined', 'This deposit reference was declined; use a new reference');
+        // A declined deposit's or released stake's ref is spent: a retry under it would never count toward limits.
+        if (seen.rows.some((r) => r.kind === spent)) {
+          return deny('reference_declined', 'This reference was declined or released; use a new reference');
         }
         if (seen.rows.some((r) => r.kind === kind)) return allow;
       }
@@ -937,7 +951,8 @@ export class ResponsibleGambling implements RgGate {
     const end = row.ended_at && row.ended_at < at ? row.ended_at : at;
     const net = await this.pool.query<{ net: bigint }>(
       `SELECT (COALESCE(SUM(amount) FILTER (WHERE kind = 'SETTLEMENT'), 0)
-             - COALESCE(SUM(amount) FILTER (WHERE kind = 'STAKE'), 0))::bigint AS net
+             - COALESCE(SUM(amount) FILTER (WHERE kind = 'STAKE'), 0)
+             + COALESCE(SUM(amount) FILTER (WHERE kind = 'STAKE_RELEASED'), 0))::bigint AS net
          FROM activity WHERE player_id = $1 AND currency = $2 AND occurred_at >= $3 AND occurred_at <= $4`,
       [playerId, st.currency, row.started_at, end],
     );

@@ -436,7 +436,7 @@ export class BettingService implements BetStore {
   }
 
   /**
-   * Posts the stake of a PENDING bet and marks it OPEN, or REJECTED if the ledger refuses.
+   * Records the stake with RG, posts it and marks the bet OPEN, or REJECTED if RG or the ledger refuses.
    * The row lock serialises completers (request, duplicate, sweeper); the ledger key makes the
    * debit happen at most once (FR-BET-005, FR-WAL-003).
    */
@@ -445,10 +445,20 @@ export class BettingService implements BetStore {
       const r = await c.query<BetRow>('SELECT * FROM bets WHERE bet_id = $1 FOR UPDATE', [betId]);
       const row = r.rows[0];
       if (!row || row.status !== 'PENDING') return null;
+      // Count the stake against period limits before taking it; idempotent per bet (FR-RG-002).
+      const rgRef = `bet:${betId}`;
+      const gate = await this.deps.rg.checkAndRecordStake(row.player_id, row.currency, row.total_stake, rgRef, this.deps.clock.now());
+      if (!gate.allowed) {
+        const err = new AppError(gate.code, 403, gate.detail);
+        await this.releaseLiability(c, betId, row.currency);
+        await this.markRejected(c, betId, err);
+        return err;
+      }
       try {
         await this.deps.ledger.post(stakePosting(row.bet_id, row.player_id, row.currency, row.total_stake));
       } catch (err) {
         if (!isRefusal(err)) throw err; // outage: leave PENDING for retry or the sweeper
+        await this.deps.rg.releaseStake(row.player_id, row.currency, row.total_stake, rgRef, this.deps.clock.now());
         await this.releaseLiability(c, betId, row.currency);
         await this.markRejected(c, betId, err);
         return err;

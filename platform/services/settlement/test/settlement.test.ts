@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AppError, testDb, type LegOutcome, type Pool, type SelectionResult } from '@bp/common';
 import { Settlement, type SettlementDeps } from '../src/index.js';
-import { FakeBetStore, FakeLedger, makeBet } from './fakes.js';
+import { FakeBetStore, FakeLedger, FakeRg, makeBet } from './fakes.js';
 
 const MIGRATIONS = fileURLToPath(new URL('../migrations', import.meta.url));
 const NOW = new Date('2026-10-01T18:00:00Z');
@@ -22,8 +22,9 @@ afterAll(async () => {
 const setup = (extra: Partial<SettlementDeps> = {}) => {
   const bets = new FakeBetStore();
   const ledger = new FakeLedger();
-  const svc = new Settlement({ pool, bets, ledger, now: () => NOW, ...extra });
-  return { bets, ledger, svc };
+  const rg = new FakeRg();
+  const svc = new Settlement({ pool, bets, ledger, rg, now: () => NOW, ...extra });
+  return { bets, ledger, rg, svc };
 };
 
 const sel = () => `sel-${randomUUID()}`;
@@ -112,7 +113,7 @@ describe('result intake', () => {
 
 describe('settlement', () => {
   it('FR-STL-005 FR-STL-012 settles once with zero-sum lines and records versions and source', async () => {
-    const { svc, bets, ledger } = setup();
+    const { svc, bets, ledger, rg } = setup();
     const [a, b] = [sel(), sel()];
     const bet = bets.add(makeBet({ legs: [[a, '2.00'], [b, '1.50']], unitStake: 1_000n }));
     const r1 = await confirm(svc, a, 'WON');
@@ -128,6 +129,8 @@ describe('settlement', () => {
     expect(ledger.op('BETS_OPEN')).toBe(-1_000n);
     expect(ledger.op('GGR')).toBe(-2_000n);
     expect(bets.bets.get(bet.betId)!.status).toBe('SETTLED');
+    // FR-RG-002: RG learns the stake and the return, so loss limits net out the win.
+    expect(rg.settled.get(`bet:${bet.betId}`)).toEqual({ stake: 1_000n, returned: 3_000n });
 
     const [row] = await svc.settlementsFor(bet.betId);
     expect(row).toMatchObject({ version: 1, status: 'POSTED', grossReturn: 3_000n, tax: 0n, netReturn: 3_000n, source: 'AUTO', actor: null });

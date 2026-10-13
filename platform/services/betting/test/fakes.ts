@@ -81,6 +81,23 @@ export class FakeRg implements RgGate {
   async checkDeposit(): Promise<GateDecision> {
     return { allowed: true };
   }
+  /** Refusal applied only at completion, after validation passed. */
+  refuseOnRecord: GateDecision | null = null;
+  readonly recorded = new Map<string, Minor>();
+  readonly released = new Set<string>();
+  async checkAndRecordStake(_p: string, _c: string, stake: Minor, ref: string): Promise<GateDecision> {
+    const d = this.refuse ?? this.refuseOnRecord;
+    if (d) return d;
+    this.recorded.set(ref, stake);
+    return { allowed: true };
+  }
+  async releaseStake(_p: string, _c: string, _s: Minor, ref: string): Promise<boolean> {
+    this.released.add(ref);
+    return true;
+  }
+  async recordSettlement(): Promise<boolean> {
+    return true;
+  }
 }
 
 const accountKey = (a: AccountRef) =>

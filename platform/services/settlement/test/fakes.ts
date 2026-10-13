@@ -107,3 +107,12 @@ export const makeBet = (opts: {
     status: 'OPEN',
   };
 };
+
+/** Records what settlement reported to RG, by ref. */
+export class FakeRg {
+  readonly settled = new Map<string, { stake: Minor; returned: Minor }>();
+  async recordSettlement(_p: string, _c: string, stake: Minor, returned: Minor, ref: string): Promise<boolean> {
+    this.settled.set(ref, { stake, returned });
+    return true;
+  }
+}

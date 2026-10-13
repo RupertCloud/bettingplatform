@@ -16,6 +16,7 @@ afterAll(async () => {
 beforeEach(() => {
   env.clock.t = T0;
   env.rg.refuse = null;
+  env.rg.refuseOnRecord = null;
   env.ledger.outage = false;
   env.hooks.duringSleep = async () => undefined;
 });
@@ -309,6 +310,29 @@ describe('recovery and BetStore', () => {
     expect(res.rejected).toBe(1);
     expect((await env.betting.listBets(p))[0]!.status).toBe('REJECTED');
     expect(await env.betting.liability(s, 'XAF')).toBe(0n);
+  });
+
+  it('FR-RG-002 records the stake with RG when the bet opens', async () => {
+    const p = player();
+    const { bet } = await env.betting.placeBet(req(p, [[sel(20_000n), 20_000n]]));
+    expect(env.rg.recorded.get(`bet:${bet.betId}`)).toBe(bet.totalStake);
+  });
+
+  it('FR-RG-002 rejects at completion when the recording gate refuses, taking no money', async () => {
+    const p = player();
+    const s = sel(20_000n);
+    env.rg.refuseOnRecord = { allowed: false, code: 'stake_limit_reached', detail: 'Daily stake limit reached' };
+    expect((await rejection(env.betting.placeBet(req(p, [[s, 20_000n]])))).code).toBe('stake_limit_reached');
+    expect(env.ledger.cash(p)).toBe(1_000_000n);
+    expect(await env.betting.liability(s, 'XAF')).toBe(0n);
+    expect((await env.betting.listBets(p))[0]!.status).toBe('REJECTED');
+  });
+
+  it('FR-RG-002 releases the recorded stake when the ledger refuses the bet', async () => {
+    const p = player(500n);
+    await rejection(env.betting.placeBet(req(p, [[sel(20_000n), 20_000n]])));
+    const [bet] = await env.betting.listBets(p);
+    expect(env.rg.released.has(`bet:${bet!.betId}`)).toBe(true);
   });
 
   it('FR-STL-011 openBetsForSelections and markStatus move bets out of OPEN and release liability', async () => {

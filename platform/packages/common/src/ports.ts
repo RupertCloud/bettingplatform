@@ -140,8 +140,18 @@ export type GateDecision =
   | { allowed: false; code: string; detail: string };
 
 export interface RgGate {
+  /** Read-only check; use for early refusal. Does not count the stake. */
   checkStake(playerId: PlayerId, currency: Currency, stake: Minor, at: Date): Promise<GateDecision>;
   checkDeposit(playerId: PlayerId, currency: Currency, amount: Minor, at: Date): Promise<GateDecision>;
+  /**
+   * Checks the stake against period limits and, when allowed, records it under ref in the
+   * same transaction, so parallel bets cannot both pass a limit (FR-RG-002). Idempotent per ref.
+   */
+  checkAndRecordStake(playerId: PlayerId, currency: Currency, stake: Minor, ref: string, at: Date): Promise<GateDecision>;
+  /** The stake recorded under ref was never taken (bet refused after recording); stop counting it. */
+  releaseStake(playerId: PlayerId, currency: Currency, stake: Minor, ref: string, at: Date): Promise<unknown>;
+  /** A settled bet: what was staked and what was returned, so loss limits net out wins. Idempotent per ref. */
+  recordSettlement(playerId: PlayerId, currency: Currency, stake: Minor, returned: Minor, ref: string, at: Date): Promise<unknown>;
 }
 
 // ---------- Bets (FR-BET, FR-STL) ----------
