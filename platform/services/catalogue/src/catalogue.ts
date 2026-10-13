@@ -124,13 +124,15 @@ interface EventRow {
 /**
  * Read-side guard applied wherever a state is shown, so a missed scheduler run never lets a bet through:
  * a pre-match-only event past its start is closed (FR-SPD-007), and a started feed event whose pricing
- * source has been silent for more than 5 s is suspended (FR-SPD-006). Uses $2 = now, $3 = primary source,
+ * source has been silent for more than 5 s, or has recovered from such a silence since the event was last
+ * priced, is suspended (FR-SPD-006/013). Uses $2 = now, $3 = primary source,
  * and expects aliases e (events) and hb (heartbeat of the sport's active source; see GUARD_JOIN).
  */
 const shown = (state: string): string => `CASE
   WHEN ${state} IN ('OPEN', 'SUSPENDED') AND NOT e.in_play_offered AND e.starts_at <= $2 THEN 'CLOSED'
   WHEN ${state} = 'OPEN' AND e.origin = 'feed' AND e.status <> 'ENDED' AND (e.status = 'LIVE' OR e.starts_at <= $2)
-       AND (hb.last_seen IS NULL OR hb.last_seen < $2::timestamptz - interval '${HEARTBEAT_TIMEOUT_MS} milliseconds') THEN 'SUSPENDED'
+       AND (hb.last_seen IS NULL OR hb.last_seen < $2::timestamptz - interval '${HEARTBEAT_TIMEOUT_MS} milliseconds'
+            OR COALESCE(e.prices_at, '-infinity') < hb.recovered_at) THEN 'SUSPENDED'
   ELSE ${state} END`;
 const GUARD_JOIN = `JOIN sports sp ON sp.key = e.sport
   LEFT JOIN source_heartbeats hb ON hb.source = COALESCE(sp.active_source, $3)`;
@@ -283,7 +285,9 @@ export class CatalogueService implements Catalogue {
     this.assertSource(source);
     await this.pool.query(
       `INSERT INTO source_heartbeats (source, last_seen) VALUES ($1, $2)
-       ON CONFLICT (source) DO UPDATE SET last_seen = GREATEST(source_heartbeats.last_seen, EXCLUDED.last_seen)`,
+       ON CONFLICT (source) DO UPDATE SET last_seen = GREATEST(source_heartbeats.last_seen, EXCLUDED.last_seen),
+         recovered_at = CASE WHEN EXCLUDED.last_seen > source_heartbeats.last_seen + interval '${HEARTBEAT_TIMEOUT_MS} milliseconds'
+                             THEN EXCLUDED.last_seen ELSE source_heartbeats.recovered_at END`,
       [source, this.now()],
     );
   }
@@ -374,11 +378,14 @@ export class CatalogueService implements Catalogue {
     const changed =
       !created && (event.starts_at.getTime() !== ev.startsAt.getTime() || event.home_id !== homeId || event.away_id !== awayId);
     const status = STATUS_RANK[ev.status] > STATUS_RANK[event.status] ? ev.status : event.status;
+    // FR-SPD-006/013: only an update carrying prices lifts a heartbeat suspension; a bare status update does not.
+    const priced = (ev.markets?.length ?? 0) > 0;
     await c.query(
       `UPDATE events SET starts_at = $2, home_id = $3, away_id = $4, name = $5, status = $6, feed_suspended = $7,
-              stale = false, review_required = review_required OR $8, updated_at = $9
+              stale = stale AND NOT $10, prices_at = CASE WHEN $10 THEN $9 ELSE prices_at END,
+              review_required = review_required OR $8, updated_at = $9
         WHERE id = $1`,
-      [eventId, ev.startsAt, homeId, awayId, `${ev.home.name} v ${ev.away.name}`, status, ev.suspended, changed, at],
+      [eventId, ev.startsAt, homeId, awayId, `${ev.home.name} v ${ev.away.name}`, status, ev.suspended, changed, at, priced],
     );
 
     if (status === 'ENDED') {
