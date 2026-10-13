@@ -374,7 +374,7 @@ describe('manual settle and void', () => {
       .toBe('EXECUTED');
     // Actions older than 24 hours no longer count.
     const later = new Date(NOW.getTime() + 25 * 3600_000);
-    const svcLater = new Settlement({ pool, bets, ledger, now: () => later, approvalThresholds: { XAF: 5_000n } });
+    const svcLater = new Settlement({ pool, bets, ledger, rg: new FakeRg(), now: () => later, approvalThresholds: { XAF: 5_000n } });
     const s5 = sel();
     bets.add(makeBet({ legs: [[s5, '2.00']], unitStake: 2_000n }));
     expect((await svcLater.requestManual({ action: 'VOID', reason: 'r', results: [{ selectionId: s5 }] }, { staffId: trader }, 'split-5')).status)
