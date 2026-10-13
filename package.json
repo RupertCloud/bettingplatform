@@ -1,0 +1,18 @@
+{
+  "name": "bettingplatform",
+  "private": true,
+  "description": "Repo root for Firebase App Hosting: builds and serves the web/ site",
+  "workspaces": [
+    "web"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w web",
+    "start": "npm run start -w web"
+  },
+  "overrides": {
+    "postcss": "8.5.28"
+  }
+}
