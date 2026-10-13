@@ -1,0 +1,20 @@
+{
+  "name": "@bp/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end tests wiring the real Release 1 services together over PostgreSQL",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@bp/betting": "*",
+    "@bp/catalogue": "*",
+    "@bp/common": "*",
+    "@bp/identity": "*",
+    "@bp/rg": "*",
+    "@bp/settlement": "*",
+    "@bp/wallet": "*"
+  }
+}

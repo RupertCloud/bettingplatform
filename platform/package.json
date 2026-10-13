@@ -4,7 +4,8 @@
   "description": "Release 1 platform services built to docs/srs/betting-platform-srs.md",
   "workspaces": [
     "packages/*",
-    "services/*"
+    "services/*",
+    "tests/*"
   ],
   "engines": {
     "node": ">=20"
