@@ -354,6 +354,44 @@ describe('manual settle and void', () => {
     ]);
   });
 
+  it('FR-STL-009 FR-BO-011 counts the requester\'s unapproved actions of the last 24h, so splitting a void needs approval', async () => {
+    const { svc, bets, ledger } = setup({ approvalThresholds: { XAF: 5_000n } });
+    const trader = `tr-split-${randomUUID()}`;
+    const [s1, s2, s3] = [sel(), sel(), sel()];
+    for (const s of [s1, s2, s3]) bets.add(makeBet({ legs: [[s, '2.00']], unitStake: 2_000n }));
+    const void1 = (s: string, key: string) =>
+      svc.requestManual({ action: 'VOID', reason: 'Market abandoned', results: [{ selectionId: s }] }, { staffId: trader }, key);
+    expect((await void1(s1, 'split-1')).status).toBe('EXECUTED');
+    expect((await void1(s2, 'split-2')).status).toBe('EXECUTED');
+    // 2,000 + 2,000 + 2,000 = 6,000 > 5,000 within 24 hours.
+    const third = await void1(s3, 'split-3');
+    expect(third.status).toBe('PENDING_APPROVAL');
+    expect(ledger.entries.size).toBe(2);
+    // Another trader is not affected by this trader's history.
+    const s4 = sel();
+    bets.add(makeBet({ legs: [[s4, '2.00']], unitStake: 2_000n }));
+    expect((await svc.requestManual({ action: 'VOID', reason: 'r', results: [{ selectionId: s4 }] }, { staffId: `${trader}-b` }, 'k')).status)
+      .toBe('EXECUTED');
+    // Actions older than 24 hours no longer count.
+    const later = new Date(NOW.getTime() + 25 * 3600_000);
+    const svcLater = new Settlement({ pool, bets, ledger, now: () => later, approvalThresholds: { XAF: 5_000n } });
+    const s5 = sel();
+    bets.add(makeBet({ legs: [[s5, '2.00']], unitStake: 2_000n }));
+    expect((await svcLater.requestManual({ action: 'VOID', reason: 'r', results: [{ selectionId: s5 }] }, { staffId: trader }, 'split-5')).status)
+      .toBe('EXECUTED');
+  });
+
+  it('FR-STL-009 FR-BO-011 concurrent split requests cannot both slip under the threshold', async () => {
+    const { svc, bets } = setup({ approvalThresholds: { XAF: 5_000n } });
+    const trader = `tr-race-${randomUUID()}`;
+    const sels = [sel(), sel(), sel(), sel()];
+    for (const s of sels) bets.add(makeBet({ legs: [[s, '2.00']], unitStake: 2_000n }));
+    const out = await Promise.all(sels.map((s, i) =>
+      svc.requestManual({ action: 'VOID', reason: 'Market abandoned', results: [{ selectionId: s }] }, { staffId: trader }, `race-${i}`)));
+    expect(out.filter((a) => a.status === 'EXECUTED')).toHaveLength(2);
+    expect(out.filter((a) => a.status === 'PENDING_APPROVAL')).toHaveLength(2);
+  });
+
   it('FR-STL-009 requires a reason and an outcome for SETTLE', async () => {
     const { svc } = setup();
     await expect(svc.requestManual({ action: 'VOID', reason: ' ', results: [{ selectionId: sel() }] }, { staffId: 't' }, 'key-r-1'))

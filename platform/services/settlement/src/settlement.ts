@@ -145,6 +145,9 @@ const DEFAULT_THRESHOLDS: Record<Currency, Minor> = {
   USD: 1_500_000n,
 };
 
+/** Window in which a requester's unapproved manual actions add up against the threshold (FR-BO-011). */
+const MANUAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const lockKey = async (client: Client, key: string): Promise<void> => {
@@ -697,26 +700,40 @@ export class Settlement {
     if (replay) return this.checkReplay(replay, input.action, input.reason, values);
 
     const affected = await this.affectedStake(selectionIds);
-    const needsApproval = affected.some((a) => a.amount > this.thresholds[a.currency]);
     const at = this.now();
     const created = await withTx(this.pool, async (client) => {
+      // Splitting one large action into several small ones must not avoid the second approver:
+      // add this requester's unapproved actions of the last 24 hours, serialised per requester.
+      await lockKey(client, `manual_requester:${staff.staffId}`);
+      const recent = await client.query<{ affected_stake: { currency: Currency; amount: string }[] }>(
+        `SELECT affected_stake FROM manual_actions
+         WHERE requested_by = $1 AND approved_by IS NULL
+           AND (status = 'EXECUTED' OR NOT needs_approval)
+           AND COALESCE(executed_at, created_at) > $2`,
+        [staff.staffId, new Date(at.getTime() - MANUAL_WINDOW_MS)],
+      );
+      const totals = new Map<Currency, Minor>();
+      for (const a of [...recent.rows.flatMap((r) => r.affected_stake), ...affected]) {
+        totals.set(a.currency, (totals.get(a.currency) ?? 0n) + BigInt(a.amount));
+      }
+      const needsApproval = [...totals].some(([currency, amount]) => amount > this.thresholds[currency]);
       const ins = await client.query<{ action_id: string }>(
-        `INSERT INTO manual_actions (action, results, reason, requested_by, idempotency_key, affected_stake, status, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING_APPROVAL', $7)
+        `INSERT INTO manual_actions (action, results, reason, requested_by, idempotency_key, affected_stake, status, needs_approval, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING_APPROVAL', $7, $8)
          ON CONFLICT (requested_by, idempotency_key) DO NOTHING RETURNING action_id`,
         [input.action, JSON.stringify(values), input.reason, staff.staffId, idempotencyKey,
-          JSON.stringify(affected.map((a) => ({ currency: a.currency, amount: a.amount.toString() }))), at],
+          JSON.stringify(affected.map((a) => ({ currency: a.currency, amount: a.amount.toString() }))), needsApproval, at],
       );
       const id = ins.rows[0]?.action_id;
       if (id) {
         await this.audit(client, staff, `MANUAL_${input.action}_REQUEST`, `manual_action:${id}`, input.reason, null,
           { results: values, affected: affected.map((a) => ({ currency: a.currency, amount: a.amount.toString() })) });
       }
-      return id;
+      return id ? { id, needsApproval } : undefined;
     });
     if (!created) return this.checkReplay((await this.findManual(staff.staffId, idempotencyKey))!, input.action, input.reason, values);
-    if (needsApproval) return (await this.getManual(created))!;
-    return this.execute(created, staff, null);
+    if (created.needsApproval) return (await this.getManual(created.id))!;
+    return this.execute(created.id, staff, null);
   }
 
   async approveManual(actionId: string, staff: StaffContext): Promise<ManualAction> {
