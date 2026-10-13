@@ -16,10 +16,14 @@ export const createPool = (connectionString: string, schema: string): Pool => {
 };
 
 const RETRYABLE = new Set(['40001', '40P01']); // serialization failure, deadlock
+const MAX_ATTEMPTS = 10;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Runs fn in one transaction. Retries serialization failures and deadlocks up to
- * 5 times, so callers can rely on SERIALIZABLE or row locks (SRS CON-02).
+ * MAX_ATTEMPTS times with jittered backoff, so callers can rely on SERIALIZABLE or
+ * row locks (SRS CON-02). Each round of conflicting transactions commits at least
+ * one, so up to MAX_ATTEMPTS concurrent writers on one row always finish.
  */
 export const withTx = async <T>(
   pool: Pool,
@@ -36,7 +40,10 @@ export const withTx = async <T>(
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined);
       const code = (err as { code?: string }).code;
-      if (attempt < 5 && code && RETRYABLE.has(code)) continue;
+      if (attempt < MAX_ATTEMPTS && code && RETRYABLE.has(code)) {
+        await sleep(Math.random() * Math.min(50, 2 ** attempt));
+        continue;
+      }
       throw err;
     } finally {
       client.release();
