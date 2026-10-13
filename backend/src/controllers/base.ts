@@ -1,5 +1,4 @@
 import * as fs from "fs";
-import * as md5 from "md5";
 import * as crypto from "crypto";
 import * as geoip from "geoip-country";
 import * as requestIp from "request-ip";
@@ -113,6 +112,20 @@ export const getIPAddress = (req: Request) => {
   return { ip, useragent: req.useragent, ...geo };
 };
 
+// Unguessable token from a CSPRNG (SRS SEC-AUTH-003).
+export const newToken = (): string => crypto.randomBytes(32).toString("hex");
+
+// Case-insensitive exact match; escapes user input so it is never read as a
+// regex pattern (SRS FR-ACC-004).
+export const exactMatch = (value: string): RegExp =>
+  new RegExp("^" + String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i");
+
+export const safeEqual = (a: string, b: string): boolean => {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
 export const signAccessToken = (
   req: Request,
   res: Response,
@@ -121,8 +134,8 @@ export const signAccessToken = (
   try {
     if (userId) {
       const expiration = getSessionTime();
-      const accessToken = md5(userId + expiration);
-      const refreshToken = md5(userId + expiration);
+      const accessToken = newToken();
+      const refreshToken = newToken();
       const ip = getIPAddress(req);
       return { accessToken, refreshToken, expiration, userId, ...ip };
     }
@@ -553,7 +566,11 @@ export const random = (min: number, max: number, floor = true): number => {
 export const log = async (req: Request, res: Response) => {
   const path = req.params.path;
   const id = req.params.id;
-  if (id === process.env.ADMIN_TOKEN) {
+  if (
+    process.env.ADMIN_TOKEN &&
+    safeEqual(id, process.env.ADMIN_TOKEN) &&
+    /^[A-Za-z0-9_-]+$/.test(path)
+  ) {
     const filepath = `${config.DIR}/rlog/log-${path}.log`;
     if (fs.existsSync(filepath)) {
       const readStream = fs.createReadStream(filepath);

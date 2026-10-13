@@ -1,4 +1,3 @@
-import * as md5 from 'md5'
 import * as randomString from 'randomstring'
 import { bufferToHex } from 'ethereumjs-util'
 import { Request, Response } from 'express'
@@ -30,6 +29,8 @@ import {
   ipLimiter,
   getIpKey,
   getUserBalance,
+  newToken,
+  exactMatch,
 } from '../base'
 
 const userInfo = (user: any) => {
@@ -77,8 +78,8 @@ export const signin = async (req: Request, res: Response) => {
     }
     const user: any = await Users.findOne({
       $or: [
-        { username: { $regex: new RegExp('^' + email.toLowerCase(), 'i') } },
-        { email: { $regex: new RegExp('^' + email.toLowerCase(), 'i') } },
+        { username: { $regex: exactMatch(email) } },
+        { email: { $regex: exactMatch(email) } },
       ],
     })
     if (!user) {
@@ -136,13 +137,13 @@ export const signup = async (req: Request, res: Response) => {
   //     return res.status(400).json(`Account limited.`)
   // }
   const emailExists = await Users.findOne({
-    email: { $regex: new RegExp('^' + user.email.toLowerCase(), 'i') },
+    email: { $regex: exactMatch(user.email) },
   })
   if (emailExists) {
     return res.status(400).json(`${user.email} is used by another account.`)
   }
   const usernameExists = await Users.findOne({
-    username: { $regex: new RegExp('^' + user.username.toLowerCase(), 'i') },
+    username: { $regex: exactMatch(user.username) },
   })
   if (usernameExists) {
     return res
@@ -180,7 +181,7 @@ export const checkAddress = async (req: Request, res: Response) => {
   const { publicAddress } = req.body
   const user = await Users.findOne({
     publicAddress: {
-      $regex: new RegExp('^' + publicAddress.toLowerCase(), 'i'),
+      $regex: exactMatch(publicAddress),
     },
   })
   if (!user) {
@@ -206,7 +207,7 @@ export const joinAddress = async (req: Request, res: Response) => {
   // }
   const exists = await Users.findOne({
     publicAddress: {
-      $regex: new RegExp('^' + publicAddress.toLowerCase(), 'i'),
+      $regex: exactMatch(publicAddress),
     },
   })
   if (exists) {
@@ -243,7 +244,7 @@ export const signinMetamask = async (req: Request, res: Response) => {
   const { signature, publicAddress } = req.body
   const user: any = await Users.findOne({
     publicAddress: {
-      $regex: new RegExp('^' + publicAddress.toLowerCase(), 'i'),
+      $regex: exactMatch(publicAddress),
     },
   })
   if (!user) {
@@ -296,7 +297,7 @@ export const signinAddress = async (req: Request, res: Response) => {
   const { signature, publicAddress } = req.body
   const user: any = await Users.findOne({
     publicAddress: {
-      $regex: new RegExp('^' + publicAddress.toLowerCase(), 'i'),
+      $regex: exactMatch(publicAddress),
     },
   })
   if (!user) {
@@ -355,14 +356,14 @@ export const info = async (req: Request, res: Response) => {
     const { userId, email, username, avatar } = req.body
     const emailExists = await Users.findOne({
       _id: { $ne: ObjectId(userId) },
-      email: { $regex: new RegExp('^' + email.toLowerCase(), 'i') },
+      email: { $regex: exactMatch(email) },
     })
     if (emailExists) {
       return res.status(400).json(`${email} is used by another account.`)
     }
     const usernameExists = await Users.findOne({
       _id: { $ne: ObjectId(userId) },
-      username: { $regex: new RegExp('^' + username.toLowerCase(), 'i') },
+      username: { $regex: exactMatch(username) },
     })
     if (usernameExists) {
       return res
@@ -442,11 +443,13 @@ export const forgot = async (req: Request, res: Response) => {
   if (!recaptchaResult) {
     return res.status(400).json('Please check the robot again!')
   }
-  const user: any = await Users.findOne({ email })
+  const user: any =
+    typeof email === 'string' ? await Users.findOne({ email }) : null
   if (user) {
     const ip = getIPAddress(req)
     const expiration = getSessionTime()
-    const passwordToken = md5(user._id + expiration)
+    // Expiry is part of the stored token, so it cannot be altered (30 min).
+    const passwordToken = `${newToken()}.${Date.now() + 30 * 60 * 1000}`
     const session = { passwordToken, expiration, ...ip }
     await Sessions.updateOne({ userId: user._id }, session, {
       new: true,
@@ -472,6 +475,12 @@ export const forgot = async (req: Request, res: Response) => {
 
 export const passwordReset = async (req: Request, res: Response) => {
   const { userId, token, password } = req.body
+  if (
+    typeof token !== 'string' ||
+    !/^[0-9a-f]{64}\.\d+$/.test(token) ||
+    Number(token.split('.')[1]) < Date.now()
+  )
+    return res.status(400).json('Invalid link or expired')
   const user: any = await Users.findById(userId)
   if (!user) return res.status(400).json('invalid link or expired')
   const sessions = await Sessions.findOne({

@@ -7,13 +7,13 @@ export const solanaRPCurls = () => {
     // "https://api.mainnet-beta.solana.com",
     // "https://solana-api.projectserum.com",
     // "https://rpc.ankr.com/solana",
-    "https://hidden-wandering-aura.solana-mainnet.quiknode.pro/e0a0b8715ea82e2abccff89f6ceed40bd68f9875/",
+    process.env.SOLANA_RPC_URL as string,
   ];
 };
 
 export const getSolanaRPCurl = () => {
   // const rpcurls = solanaRPCurls();
-  return "https://hidden-wandering-aura.solana-mainnet.quiknode.pro/e0a0b8715ea82e2abccff89f6ceed40bd68f9875/";
+  return process.env.SOLANA_RPC_URL as string;
 };
 
 export const getSolanaConnection = () => {
@@ -36,7 +36,7 @@ export const getEtherRPCurl = () => {
 
 export const binanceRPCurls = () => {
   return [
-    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
+    process.env.BSC_RPC_URL as string,
     "https://binance.nodereal.io",
     "https://bsc-dataseed.binance.org",
     "https://bsc-dataseed2.defibit.io",
