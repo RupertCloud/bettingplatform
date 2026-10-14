@@ -11,7 +11,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build -w @bp/common && npm run build -w @bp/betting -w @bp/catalogue -w @bp/identity -w @bp/rg -w @bp/settlement -w @bp/wallet && npm run build -w @bp/gateway",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
   },
