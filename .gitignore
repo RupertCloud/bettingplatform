@@ -1,0 +1,4 @@
+node_modules/
+.next/
+.apphosting/
+next-env.d.ts

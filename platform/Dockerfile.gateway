@@ -1,0 +1,31 @@
+# Player API gateway (services/gateway) for Cloud Run. Build from platform/:
+#   docker build -f Dockerfile.gateway -t bp-gateway .
+
+FROM node:22-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json tsconfig.base.json ./
+COPY packages/common/package.json packages/common/
+COPY services/betting/package.json services/betting/
+COPY services/catalogue/package.json services/catalogue/
+COPY services/gateway/package.json services/gateway/
+COPY services/identity/package.json services/identity/
+COPY services/rg/package.json services/rg/
+COPY services/settlement/package.json services/settlement/
+COPY services/wallet/package.json services/wallet/
+COPY tests/e2e/package.json tests/e2e/
+RUN npm ci
+COPY packages packages
+COPY services services
+RUN npm run build && npm prune --omit=dev
+
+FROM node:22-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build --chown=root:root /app/package.json ./
+COPY --from=build --chown=root:root /app/node_modules node_modules
+COPY --from=build --chown=root:root /app/packages packages
+COPY --from=build --chown=root:root /app/services services
+USER node
+ENV PORT=8080
+EXPOSE 8080
+CMD ["node", "services/gateway/dist/main.js"]

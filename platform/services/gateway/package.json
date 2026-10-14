@@ -1,0 +1,33 @@
+{
+  "name": "@bp/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Player API gateway: the Release 1 services in one process behind one public HTTP app",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "vitest run",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@bp/betting": "*",
+    "@bp/catalogue": "*",
+    "@bp/common": "*",
+    "@bp/identity": "*",
+    "@bp/rg": "*",
+    "@bp/settlement": "*",
+    "@bp/wallet": "*",
+    "@fastify/cors": "11.3.0",
+    "fastify": "5.12.7",
+    "zod": "3.25.76"
+  }
+}

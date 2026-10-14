@@ -7,6 +7,7 @@ import {
   signAccessToken,
   ipLimiter,
   getIpKey,
+  exactMatch,
 } from '../base'
 import {
   BalanceHistories,
@@ -80,8 +81,8 @@ export const signin = async (req: Request, res: Response) => {
   } else {
     const user: any = await Users.findOne({
       $or: [
-        { username: { $regex: new RegExp('^' + email.toLowerCase(), 'i') } },
-        { email: { $regex: new RegExp('^' + email.toLowerCase(), 'i') } },
+        { username: { $regex: exactMatch(email) } },
+        { email: { $regex: exactMatch(email) } },
       ],
     })
     if (!user) {
@@ -133,13 +134,13 @@ export const signup = async (req: Request, res: Response) => {
     return res.status(400).json(`You can't access here.`)
   const user = req.body
   const emailExists = await Users.findOne({
-    email: { $regex: new RegExp('^' + user.email.toLowerCase(), 'i') },
+    email: { $regex: exactMatch(user.email) },
   })
   if (emailExists) {
     return res.status(400).json(`${user.email} is used by another account.`)
   }
   const usernameExists = await Users.findOne({
-    username: { $regex: new RegExp('^' + user.username.toLowerCase(), 'i') },
+    username: { $regex: exactMatch(user.username) },
   })
   if (usernameExists) {
     return res

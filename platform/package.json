@@ -1,0 +1,23 @@
+{
+  "name": "betting-platform",
+  "private": true,
+  "description": "Release 1 platform services built to docs/srs/betting-platform-srs.md",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "tests/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w @bp/common && npm run build -w @bp/betting -w @bp/catalogue -w @bp/identity -w @bp/rg -w @bp/settlement -w @bp/wallet && npm run build -w @bp/gateway",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}

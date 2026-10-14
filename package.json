@@ -1,0 +1,22 @@
+{
+  "name": "bettingplatform-web",
+  "private": true,
+  "description": "Web site served by Firebase App Hosting from the repo root",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "next": "15.5.27",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "overrides": {
+    "postcss": "8.5.28"
+  }
+}
