@@ -46,22 +46,25 @@ describe('sessions', () => {
     await h.identity.authenticateAccess(t2.accessToken);
   });
 
-  it('SEC-AUTH-003 reuse of a rotated refresh token revokes the whole session', async () => {
+  it('SEC-AUTH-003 reuse of a rotated refresh token after the 10 s grace revokes the whole session', async () => {
     const { email } = await newPlayer();
     const t1 = await loginAs(email);
     const t2 = await h.identity.refresh(t1.refreshToken);
+    h.clock.advance(10_001);
     expect(await errCode(h.identity.refresh(t1.refreshToken))).toBe('unauthenticated');
     expect(await errCode(h.identity.authenticateAccess(t2.accessToken))).toBe('unauthenticated');
     expect(await errCode(h.identity.refresh(t2.refreshToken))).toBe('unauthenticated');
   });
 
-  it('SEC-AUTH-003 concurrent refreshes with one token: one wins, the replay revokes the session', async () => {
+  it('SEC-AUTH-003 concurrent refreshes with one token (two tabs) both succeed and keep the session', async () => {
     const { email } = await newPlayer();
     const t1 = await loginAs(email);
-    const results = await Promise.allSettled([h.identity.refresh(t1.refreshToken), h.identity.refresh(t1.refreshToken)]);
-    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
-    const { revoke_reason } = (await h.pool.query('SELECT revoke_reason FROM sessions WHERE id = $1', [t1.sessionId])).rows[0];
-    expect(revoke_reason).toBe('refresh_token_reuse');
+    const results = await Promise.all([h.identity.refresh(t1.refreshToken), h.identity.refresh(t1.refreshToken)]);
+    expect(results[0].sessionId).toBe(t1.sessionId);
+    expect(results[0].refreshToken).not.toBe(results[1].refreshToken);
+    for (const t of results) await h.identity.authenticateAccess(t.accessToken);
+    const { revoked_at } = (await h.pool.query('SELECT revoked_at FROM sessions WHERE id = $1', [t1.sessionId])).rows[0];
+    expect(revoked_at).toBeNull();
   });
 
   it('FR-ACC-018 ends a session after 30 minutes idle', async () => {

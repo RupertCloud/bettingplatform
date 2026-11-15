@@ -1,29 +1,25 @@
 // One process, one public HTTP app: wires the six Release 1 services against one database (a schema each)
 // and forwards the player-facing routes to each service's own Fastify app. Nothing else is reachable.
-import { randomBytes } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type HTTPMethods } from 'fastify';
 import cors from '@fastify/cors';
 import { z } from 'zod';
-import { AppError, createPool, migrate, toProblem, type Pool } from '@bp/common';
-import { BettingService, buildServer as bettingServer } from '@bp/betting';
-import { CatalogueService, buildServer as catalogueServer } from '@bp/catalogue';
-import { Identity, RG_ACTOR, buildServer as identityServer, playerBearerAuth } from '@bp/identity';
-import { ResponsibleGambling, buildServer as rgServer, type Clock } from '@bp/rg';
-import { Settlement } from '@bp/settlement';
-import { Wallet, buildServer as walletServer } from '@bp/wallet';
+import { AppError, toProblem } from '@bp/common';
+import { type BettingService, buildServer as bettingServer } from '@bp/betting';
+import { type CatalogueService, buildServer as catalogueServer } from '@bp/catalogue';
+import { type Identity, buildServer as identityServer, playerBearerAuth } from '@bp/identity';
+import { type ResponsibleGambling, buildServer as rgServer } from '@bp/rg';
+import type { Settlement } from '@bp/settlement';
+import { type Wallet, buildServer as walletServer } from '@bp/wallet';
+import { buildServices, SERVICES, type ServiceName } from './services.js';
 import {
   DEMO_REFRESH_MS,
-  DemoIdentity,
-  FEED_SOURCE,
   MAX_DEPOSIT,
   MIN_DEPOSIT,
   demoDeposit,
   ingestDemoFixtures,
 } from './demo.js';
 
-export const SERVICES = ['identity', 'wallet', 'catalogue', 'rg', 'betting', 'settlement'] as const;
-export type ServiceName = (typeof SERVICES)[number];
+export { SERVICES, type ServiceName };
 
 export interface GatewayOptions {
   databaseUrl: string;
@@ -69,6 +65,7 @@ const PUBLIC_ROUTES: Record<Exclude<ServiceName, 'settlement'>, Route[]> = {
     ['DELETE', '/v1/me/sessions/:id'],
     ['POST', '/v1/me/mfa/enrol'],
     ['POST', '/v1/me/mfa/confirm'],
+    ['POST', '/v1/me/mfa/disable'],
     ['POST', '/v1/me/mfa/verify'],
   ],
   wallet: [['GET', '/v1/wallet/balances']],
@@ -98,9 +95,6 @@ const FORWARD_REQUEST = ['authorization', 'content-type', 'idempotency-key', 'us
 /** Response headers that belong to this hop, not to the forwarded response. */
 const HOP_BY_HOP = new Set(['connection', 'content-length', 'date', 'keep-alive', 'transfer-encoding']);
 
-const migrationsDir = (service: ServiceName): string =>
-  fileURLToPath(new URL(`../../${service}/migrations`, import.meta.url));
-
 const sendProblem = (reply: FastifyReply, err: unknown): FastifyReply => {
   let problem = toProblem(err);
   const status = (err as { statusCode?: unknown }).statusCode;
@@ -125,50 +119,13 @@ const depositBody = z
 /** Builds every service, runs their migrations, and returns the public app (not yet listening). */
 export const buildGateway = async (opts: GatewayOptions): Promise<Gateway> => {
   const now = opts.now ?? (() => new Date());
-  const clock: Clock = { now };
-  const prefix = opts.schemaPrefix ?? '';
-  const schemas = Object.fromEntries(SERVICES.map((s) => [s, `${prefix}${s}`])) as Record<ServiceName, string>;
-  const pools = {} as Record<ServiceName, Pool>;
-  const endPools = async () => {
-    await Promise.all(Object.values(pools).map((p) => p.end()));
-  };
-  try {
-    for (const s of SERVICES) {
-      pools[s] = createPool(opts.databaseUrl, schemas[s]);
-      await migrate(pools[s], schemas[s], migrationsDir(s));
-    }
-  } catch (err) {
-    await endPools();
-    throw err;
-  }
-
-  const identityOpts = { pool: pools.identity, now, mfaKey: opts.mfaKey ?? randomBytes(32) };
-  const identity = opts.demo ? new DemoIdentity(identityOpts) : new Identity(identityOpts);
-  const wallet = new Wallet(pools.wallet, { now });
-  const catalogue = new CatalogueService(pools.catalogue, { primarySource: FEED_SOURCE, now });
-  const rg = new ResponsibleGambling({
-    pool: pools.rg,
-    players: identity,
-    // rg pushes time-outs and self-exclusions into identity's audited state change.
-    stateSink: {
-      async setState(playerId, state, until) {
-        await identity.setState(playerId, state, RG_ACTOR, `rg:${state.toLowerCase()}`, { until });
-      },
-    },
-    clock,
+  const { schemas, identity, wallet, catalogue, rg, betting, settlement, end: endPools } = await buildServices({
+    databaseUrl: opts.databaseUrl,
+    demo: opts.demo,
+    ...(opts.mfaKey ? { mfaKey: opts.mfaKey } : {}),
+    ...(opts.schemaPrefix ? { schemaPrefix: opts.schemaPrefix } : {}),
+    now,
   });
-  const betting = new BettingService({
-    pool: pools.betting,
-    players: identity,
-    catalogue,
-    rg,
-    ledger: wallet,
-    clock,
-    config: {
-      limits: { XAF: { global: { minStake: 100n, maxStake: 5_000_000n, maxPayout: 100_000_000n } } },
-    },
-  });
-  const settlement = new Settlement({ pool: pools.settlement, bets: betting, ledger: wallet, rg, now });
 
   const authenticate = playerBearerAuth(identity);
   const upstream: Record<keyof typeof PUBLIC_ROUTES, FastifyInstance> = {

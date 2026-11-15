@@ -25,6 +25,11 @@ export interface SettlementDeps {
   taxAccountKind?: OperatorAccountKind;
   /** Manual actions whose affected stake is above this, per currency, need a second approver. */
   approvalThresholds?: Partial<Record<Currency, Minor>>;
+  /**
+   * Result feeds that must agree before a result is confirmed automatically. Default 2 (primary and
+   * secondary). With 1, the primary alone confirms; a secondary that disagrees still opens a mismatch.
+   */
+  resultSources?: 1 | 2;
 }
 
 export interface StaffContext {
@@ -55,6 +60,8 @@ export interface ResultValue {
 
 export interface Mismatch {
   mismatchId: string;
+  /** FEEDS_DISAGREE: primary vs secondary. FEED_VS_MANUAL: primary is the feed, secondary the trader's result. */
+  kind: 'FEEDS_DISAGREE' | 'FEED_VS_MANUAL';
   selectionId: string;
   resultVersion: number;
   primary: ResultValue;
@@ -135,7 +142,7 @@ export interface ManualAction {
   requestedBy: string;
   approvedBy: string | null;
   affectedStake: { currency: Currency; amount: Minor }[];
-  status: 'PENDING_APPROVAL' | 'EXECUTED';
+  status: ManualStatus;
   settlement?: BatchSummary;
 }
 
@@ -147,6 +154,10 @@ const DEFAULT_THRESHOLDS: Record<Currency, Minor> = {
 
 /** Window in which a requester's unapproved manual actions add up against the threshold (FR-BO-011). */
 const MANUAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** A manual action nobody approved within this time expires (FR-BO-011). */
+export const MANUAL_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+/** How far back sweepOpenBets looks for confirmed results. */
+const SWEEP_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -233,6 +244,7 @@ export class Settlement {
   private readonly taxPolicy: TaxPolicy;
   private readonly taxAccountKind: OperatorAccountKind | undefined;
   private readonly thresholds: Record<Currency, Minor>;
+  private readonly resultSources: 1 | 2;
 
   constructor(deps: SettlementDeps) {
     this.pool = deps.pool;
@@ -244,6 +256,7 @@ export class Settlement {
     this.taxPolicy = deps.taxPolicy ?? (() => 0n);
     this.taxAccountKind = deps.taxAccountKind;
     this.thresholds = { ...DEFAULT_THRESHOLDS, ...deps.approvalThresholds };
+    this.resultSources = deps.resultSources ?? 2;
   }
 
   // ---------- Result intake (FR-STL-001) ----------
@@ -287,10 +300,22 @@ export class Settlement {
         'SELECT result_id FROM confirmed_results WHERE selection_id = $1 AND result_version = $2',
         [value.selectionId, result.resultVersion],
       );
+      // After a trader's manual result, feeds never confirm on their own: an agreeing feed is a no-op,
+      // a different one waits for a trader (it is neither dropped nor applied without a person).
+      const manual = (await client.query<ResultDbRow & { manual_action_id: string | null }>(
+        `SELECT * FROM confirmed_results WHERE selection_id = $1 ORDER BY result_version DESC LIMIT 1`,
+        [value.selectionId],
+      )).rows[0];
+      if (manual?.manual_action_id) {
+        const feedValue = primaryRow ? this.rowValue(value.selectionId, primaryRow) : value;
+        const current = this.rowValue(value.selectionId, manual);
+        if (sameValue(feedValue, current)) return { status: 'CONFIRMED', resultId: manual.result_id };
+        return this.openMismatch(client, value.selectionId, result.resultVersion, feedValue, current, 'FEED_VS_MANUAL', at);
+      }
       if (confirmed.rows[0]) return { status: 'CONFIRMED', resultId: confirmed.rows[0].result_id };
-      if (!primaryRow || !secondaryRow) return { status: 'PENDING' };
+      if (!primaryRow || (!secondaryRow && this.resultSources === 2)) return { status: 'PENDING' };
       const primary = this.rowValue(value.selectionId, primaryRow);
-      const secondary = this.rowValue(value.selectionId, secondaryRow);
+      const secondary = secondaryRow ? this.rowValue(value.selectionId, secondaryRow) : primary;
       if (sameValue(primary, secondary)) {
         const ins = await client.query<{ result_id: string }>(
           `INSERT INTO confirmed_results (selection_id, result_version, outcome, dh_num, dh_den, confirmed_by, confirmed_at)
@@ -300,27 +325,35 @@ export class Settlement {
         );
         return { status: 'CONFIRMED', resultId: ins.rows[0]!.result_id };
       }
-      const mm = await client.query<{ mismatch_id: string }>(
-        `INSERT INTO result_mismatches (selection_id, result_version, primary_result, secondary_result, created_at)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (selection_id, result_version) DO UPDATE SET selection_id = EXCLUDED.selection_id
-         RETURNING mismatch_id`,
-        [value.selectionId, result.resultVersion, JSON.stringify(primary), JSON.stringify(secondary), at],
-      );
-      return { status: 'MISMATCH', mismatchId: mm.rows[0]!.mismatch_id };
+      return this.openMismatch(client, value.selectionId, result.resultVersion, primary, secondary, 'FEEDS_DISAGREE', at);
     });
+  }
+
+  private async openMismatch(
+    client: Client, selectionId: string, version: number, primary: ResultValue, secondary: ResultValue,
+    kind: Mismatch['kind'], at: Date,
+  ): Promise<ResultIntake> {
+    const mm = await client.query<{ mismatch_id: string }>(
+      `INSERT INTO result_mismatches (selection_id, result_version, primary_result, secondary_result, kind, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (selection_id, result_version) DO UPDATE SET selection_id = EXCLUDED.selection_id
+       RETURNING mismatch_id`,
+      [selectionId, version, JSON.stringify(primary), JSON.stringify(secondary), kind, at],
+    );
+    return { status: 'MISMATCH', mismatchId: mm.rows[0]!.mismatch_id };
   }
 
   async listMismatches(): Promise<Mismatch[]> {
     const { rows } = await this.pool.query<{
-      mismatch_id: string; selection_id: string; result_version: number;
+      mismatch_id: string; selection_id: string; result_version: number; kind: Mismatch['kind'];
       primary_result: ResultValue; secondary_result: ResultValue; created_at: Date;
     }>(
-      `SELECT mismatch_id, selection_id, result_version, primary_result, secondary_result, created_at
+      `SELECT mismatch_id, selection_id, result_version, kind, primary_result, secondary_result, created_at
        FROM result_mismatches WHERE status = 'OPEN' ORDER BY created_at, mismatch_id`,
     );
     return rows.map((r) => ({
       mismatchId: r.mismatch_id,
+      kind: r.kind,
       selectionId: r.selection_id,
       resultVersion: r.result_version,
       primary: r.primary_result,
@@ -345,8 +378,25 @@ export class Settlement {
         'SELECT * FROM confirmed_results WHERE selection_id = $1 AND result_version = $2',
         [value.selectionId, input.resultVersion],
       );
+      const latest = (await client.query<ResultDbRow & { manual_action_id: string | null }>(
+        'SELECT * FROM confirmed_results WHERE selection_id = $1 ORDER BY result_version DESC LIMIT 1', [value.selectionId],
+      )).rows[0];
+      const resolve = () => client.query<{ mismatch_id: string; primary_result: unknown; secondary_result: unknown }>(
+        `UPDATE result_mismatches SET status = 'RESOLVED', resolved_by = $3, resolved_at = $4
+         WHERE selection_id = $1 AND result_version = $2 AND status = 'OPEN'
+         RETURNING mismatch_id, primary_result, secondary_result`,
+        [value.selectionId, input.resultVersion, staff.staffId, at],
+      );
+      // Keeping the trader's manual result against a feed that disagrees: close the mismatch, add nothing.
+      if (latest?.manual_action_id && sameValue(this.rowValue(value.selectionId, latest), value)) {
+        const resolved = await resolve();
+        if (resolved.rows[0]) {
+          await this.audit(client, staff, 'RESULT_KEEP_MANUAL', `selection:${value.selectionId}`, null, resolved.rows[0], value);
+        }
+        return toConfirmed(latest);
+      }
       const prior = existing.rows[0];
-      if (prior) {
+      if (prior && !latest?.manual_action_id) {
         if (!sameValue(this.rowValue(value.selectionId, prior), value)) {
           throw new AppError('result_conflict', 409, 'This version is already confirmed with a different result');
         }
@@ -361,18 +411,15 @@ export class Settlement {
       if (!submitted.rows.some((r) => sameValue(this.rowValue(value.selectionId, r), value))) {
         throw new AppError('result_not_submitted', 409, 'No feed reported this result; use a manual settle');
       }
+      // Accepting a feed correction over a manual result: it must become the newest version to take effect.
+      const version = latest?.manual_action_id ? Math.max(input.resultVersion, latest.result_version + 1) : input.resultVersion;
       const ins = await client.query<ResultDbRow>(
         `INSERT INTO confirmed_results (selection_id, result_version, outcome, dh_num, dh_den, confirmed_by, confirmed_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [value.selectionId, input.resultVersion, value.outcome, value.deadHeat?.numerator ?? null,
+        [value.selectionId, version, value.outcome, value.deadHeat?.numerator ?? null,
           value.deadHeat?.denominator ?? null, `trader:${staff.staffId}`, at],
       );
-      const resolved = await client.query<{ mismatch_id: string; primary_result: unknown; secondary_result: unknown }>(
-        `UPDATE result_mismatches SET status = 'RESOLVED', resolved_by = $3, resolved_at = $4
-         WHERE selection_id = $1 AND result_version = $2 AND status = 'OPEN'
-         RETURNING mismatch_id, primary_result, secondary_result`,
-        [value.selectionId, input.resultVersion, staff.staffId, at],
-      );
+      const resolved = await resolve();
       await this.audit(client, staff, 'RESULT_CONFIRM', `selection:${value.selectionId}`, null,
         resolved.rows[0] ?? null, { ...value, resultVersion: input.resultVersion });
       return toConfirmed(ins.rows[0]!);
@@ -409,6 +456,29 @@ export class Settlement {
         summary.results.push({ betId, outcome: await this.settleOne(betId, opts.actor) });
       } catch (err) {
         summary.failed.push({ betId, code: err instanceof AppError ? err.code : 'internal' });
+      }
+    }
+    return summary;
+  }
+
+  /**
+   * Settles OPEN bets on selections that already have confirmed results, for example a bet that was
+   * PENDING (wallet outage) when its selections settled and opened later. Safe to run on a timer.
+   */
+  async sweepOpenBets(now: Date = this.now()): Promise<BatchSummary> {
+    const { rows } = await this.pool.query<{ selection_id: string }>(
+      'SELECT DISTINCT selection_id FROM confirmed_results WHERE confirmed_at > $1',
+      [new Date(now.getTime() - SWEEP_WINDOW_MS)],
+    );
+    const summary: BatchSummary = { results: [], failed: [] };
+    if (rows.length === 0) return summary;
+    const open = await this.bets.openBetsForSelections(rows.map((r) => r.selection_id));
+    for (const bet of open) {
+      try {
+        const outcome = await this.settleOne(bet.betId, undefined);
+        if (outcome !== 'PENDING_RESULTS') summary.results.push({ betId: bet.betId, outcome });
+      } catch (err) {
+        summary.failed.push({ betId: bet.betId, code: err instanceof AppError ? err.code : 'internal' });
       }
     }
     return summary;
@@ -457,6 +527,41 @@ export class Settlement {
         resultSource: l.result_source,
       })),
     }));
+  }
+
+  /**
+   * FR-STL-010: finance closes a review item. RETRY posts the clawback again (it goes back to review if
+   * funds are still short); WAIVE gives up the clawback and leaves the settlement in REVIEW for the record.
+   */
+  async resolveReview(
+    reviewId: string, resolution: 'RETRY' | 'WAIVE', staff: StaffContext, reason: string,
+  ): Promise<{ resolution: 'RETRIED' | 'WAIVED'; outcome?: BetSettleOutcome }> {
+    if (!UUID.test(reviewId)) throw new AppError('not_found', 404, 'Review item not found');
+    if (!reason.trim()) throw new AppError('reason_required', 400, 'A reason is required');
+    const at = this.now();
+    const item = await withTx(this.pool, async (client) => {
+      const r = (await client.query<{ bet_id: string; settlement_version: number; status: string }>(
+        'SELECT bet_id, settlement_version, status FROM manual_review WHERE review_id = $1 FOR UPDATE', [reviewId],
+      )).rows[0];
+      if (!r) throw new AppError('not_found', 404, 'Review item not found');
+      if (r.status !== 'OPEN') throw new AppError('review_closed', 409, 'Review item is already closed');
+      await lockKey(client, `bet:${r.bet_id}`);
+      const done = resolution === 'RETRY' ? 'RETRIED' : 'WAIVED';
+      await client.query(
+        `UPDATE manual_review SET status = 'CLOSED', resolution = $2, resolved_by = $3, resolved_at = $4 WHERE review_id = $1`,
+        [reviewId, done, staff.staffId, at],
+      );
+      if (resolution === 'RETRY') {
+        await client.query(
+          "UPDATE settlements SET status = 'PENDING' WHERE bet_id = $1 AND version = $2 AND status = 'REVIEW'",
+          [r.bet_id, r.settlement_version],
+        );
+      }
+      await this.audit(client, staff, `REVIEW_${done}`, `review:${reviewId}`, reason, { status: 'OPEN' }, { status: 'CLOSED', resolution: done });
+      return { betId: r.bet_id, done };
+    });
+    if (item.done === 'WAIVED') return { resolution: 'WAIVED' };
+    return { resolution: 'RETRIED', outcome: await this.settleOne(item.betId, staff.staffId) };
   }
 
   async listManualReview(): Promise<ManualReviewItem[]> {
@@ -566,6 +671,14 @@ export class Settlement {
       const deltaNet = net - (posted?.net_return ?? 0n);
       const version = (latest?.version ?? 0) + 1;
       const moves = kind === 'SETTLE' || deltaGross !== 0n || deltaTax !== 0n;
+      if (latest?.status === 'REVIEW') {
+        // The new version replaces the clawback that could not be taken; its review item is done.
+        await client.query(
+          `UPDATE manual_review SET status = 'CLOSED', resolution = 'SUPERSEDED', resolved_at = $3
+           WHERE bet_id = $1 AND settlement_version = $2 AND status = 'OPEN'`,
+          [bet.betId, latest.version, this.now()],
+        );
+      }
       await client.query(
         `INSERT INTO settlements (bet_id, version, kind, status, player_id, currency, total_stake, gross_return, tax,
            net_return, delta_gross, delta_tax, delta_net, ledger_key, source, actor, created_at, posted_at)
@@ -658,7 +771,9 @@ export class Settlement {
         );
         await client.query(
           `INSERT INTO manual_review (bet_id, settlement_version, player_id, currency, delta_net, reason, created_at)
-           VALUES ($1, $2, $3, $4, $5, 'insufficient_funds', $6) ON CONFLICT DO NOTHING`,
+           VALUES ($1, $2, $3, $4, $5, 'insufficient_funds', $6)
+           ON CONFLICT (bet_id, settlement_version) DO UPDATE
+             SET status = 'OPEN', resolution = NULL, resolved_by = NULL, resolved_at = NULL`,
           [bet.betId, version, row.player_id, row.currency, row.delta_net, this.now()],
         );
         return 'MANUAL_REVIEW';
@@ -746,7 +861,56 @@ export class Settlement {
       if (action.approvedBy === staff.staffId) return action; // idempotent repeat
       throw new AppError('already_executed', 409, 'Manual action already executed');
     }
+    if (action.status !== 'PENDING_APPROVAL') {
+      throw new AppError('manual_action_closed', 409, `Manual action is ${action.status.toLowerCase()}`);
+    }
+    if (await this.expireIfStale(actionId)) {
+      throw new AppError('manual_action_expired', 409, 'Manual action was not approved within 24 hours; request it again');
+    }
     return this.execute(actionId, staff, staff.staffId);
+  }
+
+  /** The requester withdraws, or another trader rejects, a manual action waiting for approval. */
+  async rejectManual(actionId: string, staff: StaffContext, reason: string): Promise<ManualAction> {
+    if (!reason.trim()) throw new AppError('reason_required', 400, 'A reason is required');
+    const at = this.now();
+    const row = await withTx(this.pool, async (client) => {
+      const upd = await client.query<ManualDbRow>(
+        `UPDATE manual_actions SET status = 'REJECTED', closed_by = $2, closed_at = $3, close_reason = $4
+         WHERE action_id = $1 AND status = 'PENDING_APPROVAL' RETURNING *`,
+        [actionId, staff.staffId, at, reason],
+      );
+      if (upd.rows[0]) {
+        await this.audit(client, staff, `MANUAL_${upd.rows[0].action}_REJECT`, `manual_action:${actionId}`, reason,
+          { status: 'PENDING_APPROVAL' }, { status: 'REJECTED' });
+      }
+      return upd.rows[0];
+    });
+    if (row) return toManual(row);
+    const current = await this.getManual(actionId);
+    if (!current) throw new AppError('not_found', 404, 'Manual action not found');
+    if (current.status === 'REJECTED') return current; // idempotent repeat
+    throw new AppError('manual_action_closed', 409, `Manual action is ${current.status.toLowerCase()}`);
+  }
+
+  /** Expires manual actions left unapproved for 24 hours. Returns how many expired. */
+  async expireManualActions(now: Date = this.now()): Promise<number> {
+    const r = await this.pool.query(
+      `UPDATE manual_actions SET status = 'EXPIRED', closed_at = $1, close_reason = 'not approved within 24 hours'
+       WHERE status = 'PENDING_APPROVAL' AND created_at <= $2`,
+      [now, new Date(now.getTime() - MANUAL_APPROVAL_TTL_MS)],
+    );
+    return r.rowCount ?? 0;
+  }
+
+  private async expireIfStale(actionId: string): Promise<boolean> {
+    const now = this.now();
+    const r = await this.pool.query(
+      `UPDATE manual_actions SET status = 'EXPIRED', closed_at = $2, close_reason = 'not approved within 24 hours'
+       WHERE action_id = $1 AND status = 'PENDING_APPROVAL' AND created_at <= $3`,
+      [actionId, now, new Date(now.getTime() - MANUAL_APPROVAL_TTL_MS)],
+    );
+    return (r.rowCount ?? 0) > 0;
   }
 
   async getManual(actionId: string): Promise<ManualAction | null> {
@@ -859,7 +1023,10 @@ export class Settlement {
   }
 }
 
+export type ManualStatus = 'PENDING_APPROVAL' | 'EXECUTED' | 'REJECTED' | 'EXPIRED';
+
 interface ManualDbRow {
+  created_at: Date;
   action_id: string;
   action: 'SETTLE' | 'VOID';
   results: ResultValue[];
@@ -867,7 +1034,7 @@ interface ManualDbRow {
   requested_by: string;
   approved_by: string | null;
   affected_stake: { currency: Currency; amount: string }[];
-  status: 'PENDING_APPROVAL' | 'EXECUTED';
+  status: ManualStatus;
 }
 
 const toManual = (r: ManualDbRow): ManualAction => ({

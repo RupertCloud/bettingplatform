@@ -169,6 +169,7 @@ export const buildServer = (deps: HttpDeps): FastifyInstance => {
   suspensionRoute('/v1/trading/events/:id/reopen', (id, c) => catalogue.reopenEvent(id, c));
   suspensionRoute('/v1/trading/markets/:id/suspend', (id, c) => catalogue.suspendMarket(id, c));
   suspensionRoute('/v1/trading/markets/:id/reopen', (id, c) => catalogue.reopenMarket(id, c));
+  suspensionRoute('/v1/trading/markets/:id/void', (id, c) => catalogue.voidMarket(id, c));
   suspensionRoute('/v1/trading/selections/:id/suspend', (id, c) => catalogue.suspendSelection(id, c));
   suspensionRoute('/v1/trading/selections/:id/reopen', (id, c) => catalogue.reopenSelection(id, c));
 

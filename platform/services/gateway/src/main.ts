@@ -23,6 +23,12 @@ const main = async (): Promise<void> => {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error('PORT must be a TCP port number');
 
   const key = mfaKey(env.MFA_KEY);
+  const production = env.NODE_ENV === 'production';
+  // Demo mode activates accounts with full KYC and credits play money as real CASH: never in production.
+  if (production && env.DEMO_MODE === 'true') {
+    throw new Error('DEMO_MODE=true is refused when NODE_ENV=production; run the demo with NODE_ENV=staging');
+  }
+  if (production && !key) throw new Error('MFA_KEY is required when NODE_ENV=production');
   const { app } = await buildGateway({
     databaseUrl,
     demo: env.DEMO_MODE === 'true',

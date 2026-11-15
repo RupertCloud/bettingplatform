@@ -14,20 +14,48 @@ const enrolled = async () => {
   if (!r.created) throw new Error('setup');
   const login = await h.identity.login(input.email, PASSWORD, META);
   if (login.status !== 'ok') throw new Error('setup');
-  const { secret } = await h.identity.enrolMfa(r.playerId);
+  const { secret } = await h.identity.enrolMfa(r.playerId, PASSWORD);
   await h.identity.confirmMfa(r.playerId, login.tokens.sessionId, totp(secret, h.clock.t));
   h.clock.advance(30_000);
   return { playerId: r.playerId, email: input.email, secret, sessionId: login.tokens.sessionId };
 };
 
 describe('mfa', () => {
+  it('FR-ACC-008 enrolment needs the password, so a stolen access token alone cannot enrol', async () => {
+    const r = await h.identity.register(registration());
+    if (!r.created) throw new Error('setup');
+    expect(await errCode(h.identity.enrolMfa(r.playerId, 'wrong password'))).toBe('invalid_credentials');
+    const row = (await h.pool.query('SELECT mfa_pending FROM players WHERE id = $1', [r.playerId])).rows[0];
+    expect(row.mfa_pending).toBeNull();
+  });
+
+  it('FR-ACC-008 a player can turn MFA off with the password and a current code', async () => {
+    const p = await enrolled();
+    expect(await errCode(h.identity.disableMfa(p.playerId, 'wrong password', totp(p.secret, h.clock.t)))).toBe('invalid_credentials');
+    expect(await errCode(h.identity.disableMfa(p.playerId, PASSWORD, '000000'))).toBe('invalid_code');
+    await h.identity.disableMfa(p.playerId, PASSWORD, totp(p.secret, h.clock.t));
+    expect((await h.identity.login(p.email, PASSWORD, META)).status).toBe('ok');
+    expect((await h.identity.auditTrail(p.playerId)).at(-1)?.action).toBe('MFA_DISABLED');
+  });
+
+  it('FR-ACC-008 staff can reset MFA for a player who lost the device; every session ends', async () => {
+    const p = await enrolled();
+    const s = await h.identity.completeMfaLogin(
+      ((await h.identity.login(p.email, PASSWORD, META)) as { challenge: string }).challenge, totp(p.secret, h.clock.t), META,
+    );
+    await h.identity.resetMfa(p.playerId, 'staff:9', 'Identity checked by phone');
+    expect(await errCode(h.identity.authenticateAccess(s.accessToken))).toBe('unauthenticated');
+    expect((await h.identity.login(p.email, PASSWORD, META)).status).toBe('ok');
+    expect((await h.identity.auditTrail(p.playerId)).at(-1)).toMatchObject({ action: 'MFA_RESET', actor: 'staff:9' });
+  });
+
   it('FR-ACC-008 enrolment stores the TOTP secret encrypted (AES-256-GCM), not in plain text', async () => {
     const { playerId, secret } = await enrolled();
     const row = (await h.pool.query('SELECT mfa_secret, mfa_pending FROM players WHERE id = $1', [playerId])).rows[0];
     expect(row.mfa_pending).toBeNull();
     expect(row.mfa_secret.length).toBe(12 + 16 + secret.length);
     expect(row.mfa_secret.toString('latin1')).not.toContain(secret);
-    expect(await errCode(h.identity.enrolMfa(playerId))).toBe('mfa_already_enrolled');
+    expect(await errCode(h.identity.enrolMfa(playerId, PASSWORD))).toBe('mfa_already_enrolled');
   });
 
   it('FR-ACC-008 rejects a wrong confirmation code and keeps the enrolment pending', async () => {
@@ -36,7 +64,7 @@ describe('mfa', () => {
     if (!r.created) throw new Error('setup');
     const login = await h.identity.login(input.email, PASSWORD, META);
     if (login.status !== 'ok') throw new Error('setup');
-    const { secret } = await h.identity.enrolMfa(r.playerId);
+    const { secret } = await h.identity.enrolMfa(r.playerId, PASSWORD);
     const bad = totp(secret, new Date(h.clock.t.getTime() + 5 * 60_000));
     expect(await errCode(h.identity.confirmMfa(r.playerId, login.tokens.sessionId, bad))).toBe('invalid_code');
     const row = (await h.pool.query('SELECT mfa_secret, mfa_pending FROM players WHERE id = $1', [r.playerId])).rows[0];

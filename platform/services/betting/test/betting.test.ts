@@ -346,6 +346,10 @@ describe('recovery and BetStore', () => {
     expect(await env.betting.liability(s, 'XAF')).toBe(0n);
     expect((await env.betting.getBet(bet.betId))!.status).toBe('SETTLED');
     await expect(env.betting.markStatus(randomUUID(), 'SETTLED')).rejects.toMatchObject({ code: 'bet_not_found' });
+    // SETTLED is final: no way back to OPEN (which would re-add liability) or on to CASHED_OUT.
+    await expect(env.betting.markStatus(bet.betId, 'OPEN')).rejects.toMatchObject({ code: 'illegal_bet_transition' });
+    await expect(env.betting.markStatus(bet.betId, 'CASHED_OUT')).rejects.toMatchObject({ code: 'illegal_bet_transition' });
+    expect(await env.betting.liability(s, 'XAF')).toBe(0n);
   });
 
   it('FR-BET-011 lists only the player\'s bets with status and date filters', async () => {

@@ -90,6 +90,9 @@ describe('registration', () => {
     const row = (await h.pool.query('SELECT email_verified_at FROM players WHERE id = $1', [id])).rows[0];
     expect(row.email_verified_at).toEqual(h.clock.t);
     expect(await errCode(h.identity.verifyEmail(token))).toBe('invalid_token');
+    // FR-ACC-003: a verified address moves the account out of PENDING_VERIFICATION, with an audit row.
+    expect((await h.identity.getStatus(id))?.state).toBe('ACTIVE');
+    expect((await h.identity.auditTrail(id)).at(-1)).toMatchObject({ actor: 'system:email-verify', after: { state: 'ACTIVE', until: null } });
 
     await h.register();
     const late = h.lastToken('EMAIL_VERIFICATION');

@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import { api, describeError, newRequestId } from '../lib/api';
 import { comboOdds, displayOdds, formatOdds, formatXaf, parseOdds, parseStake, payout } from '../lib/format.mjs';
+import { afterResponse, nextAttempt, slipSignature } from '../lib/slip.mjs';
 import { useSlip } from './SlipProvider';
 
 export default function BetSlip() {
@@ -13,6 +14,9 @@ export default function BetSlip() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [placed, setPlaced] = useState(null);
+  // One idempotency key per slip content: a retry after a timeout or a lost response replays the same
+  // request instead of placing a second bet. Any change to the slip gets a new key.
+  const [attempt, setAttempt] = useState(null);
 
   const acca = mode === 'acca' && items.length >= 2;
   useEffect(() => {
@@ -43,7 +47,8 @@ export default function BetSlip() {
     setBusy(true);
     setError('');
     setPlaced(null);
-    const requestId = newRequestId();
+    const current = nextAttempt(attempt, slipSignature(items, stake, acca), newRequestId);
+    const { requestId } = current;
     const res = await api('/v1/bets', {
       method: 'POST',
       headers: { 'idempotency-key': requestId },
@@ -56,6 +61,7 @@ export default function BetSlip() {
       },
     });
     setBusy(false);
+    setAttempt(afterResponse(current, res));
     if (res.ok) {
       setPlaced(res.data);
       clear();

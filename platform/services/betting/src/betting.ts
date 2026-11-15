@@ -600,6 +600,9 @@ export class BettingService implements BetStore {
       const row = r.rows[0];
       if (!row || !isPortStatus(row.status)) throw new AppError('bet_not_found', 404, 'No accepted bet with that ID');
       if (row.status === status) return;
+      if (!BET_TRANSITIONS[row.status].includes(status)) {
+        throw new AppError('illegal_bet_transition', 409, `Bet cannot go from ${row.status} to ${status}`, { from: row.status, to: status });
+      }
       if (row.status === 'OPEN') await this.releaseLiability(c, betId, row.currency, -1n);
       if (status === 'OPEN') await this.releaseLiability(c, betId, row.currency, 1n);
       await c.query('UPDATE bets SET status = $2, updated_at = $3 WHERE bet_id = $1', [
@@ -724,6 +727,13 @@ export const BOOKING_CODE_PATTERN = new RegExp(`^[${BOOKING_ALPHABET}]{8}$`);
 const orderQuotes = (ids: string[], quotes: SelectionQuote[]): SelectionQuote[] => {
   const byId = new Map(quotes.map((q) => [q.selectionId, q]));
   return ids.flatMap((id) => byId.get(id) ?? []);
+};
+
+/** Accepted bets only move forward: SETTLED and CASHED_OUT are final (a resettlement keeps SETTLED). */
+const BET_TRANSITIONS: Record<BetStatus, readonly BetStatus[]> = {
+  OPEN: ['SETTLED', 'CASHED_OUT'],
+  SETTLED: [],
+  CASHED_OUT: [],
 };
 
 const isPortStatus = (s: StoredBetStatus): s is BetStatus => s === 'OPEN' || s === 'SETTLED' || s === 'CASHED_OUT';

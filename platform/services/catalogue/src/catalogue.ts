@@ -378,10 +378,12 @@ export class CatalogueService implements Catalogue {
     const changed =
       !created && (event.starts_at.getTime() !== ev.startsAt.getTime() || event.home_id !== homeId || event.away_id !== awayId);
     const status = STATUS_RANK[ev.status] > STATUS_RANK[event.status] ? ev.status : event.status;
-    // FR-SPD-006/013: only an update carrying prices lifts a heartbeat suspension; a bare status update does not.
+    // FR-SPD-006/013: only an update carrying prices lifts a suspension (heartbeat or the feed's own flag);
+    // a bare status update such as "interrupted" then "in play" with no odds keeps the event suspended.
     const priced = (ev.markets?.length ?? 0) > 0;
     await c.query(
-      `UPDATE events SET starts_at = $2, home_id = $3, away_id = $4, name = $5, status = $6, feed_suspended = $7,
+      `UPDATE events SET starts_at = $2, home_id = $3, away_id = $4, name = $5, status = $6,
+              feed_suspended = $7 OR (feed_suspended AND NOT $10),
               stale = stale AND NOT $10, prices_at = CASE WHEN $10 THEN $9 ELSE prices_at END,
               review_required = review_required OR $8, updated_at = $9
         WHERE id = $1`,
@@ -681,6 +683,56 @@ export class CatalogueService implements Catalogue {
         after,
       });
       return result;
+    });
+  }
+
+  /**
+   * FR-SPD-005: records that these selections have confirmed results, and moves each market whose selections
+   * are all resulted to SETTLED (through CLOSED when the feed never closed it). Safe to repeat.
+   * Returns the ids of the markets settled by this call.
+   */
+  async settleMarkets(selectionIds: string[], at: Date = this.now()): Promise<string[]> {
+    const ids = selectionIds.filter(isUuid);
+    if (ids.length === 0) return [];
+    return withTx(this.pool, async (c) => {
+      const events = (
+        await c.query<{ id: string }>(
+          `SELECT DISTINCT e.id FROM events e JOIN markets m ON m.event_id = e.id JOIN selections s ON s.market_id = m.id
+            WHERE s.id = ANY($1::uuid[]) ORDER BY e.id`,
+          [ids],
+        )
+      ).rows.map((r) => r.id);
+      for (const id of events) await this.lockEvent(c, id);
+      await c.query('UPDATE selections SET resulted_at = $2 WHERE id = ANY($1::uuid[]) AND resulted_at IS NULL', [ids, at]);
+      const settled = (
+        await c.query<{ id: string }>(
+          `UPDATE markets m SET state = 'SETTLED', suspended_by = NULL
+            WHERE m.id IN (SELECT market_id FROM selections WHERE id = ANY($1::uuid[]))
+              AND m.state IN ('OPEN', 'SUSPENDED', 'CLOSED')
+              AND NOT EXISTS (SELECT 1 FROM selections s WHERE s.market_id = m.id AND s.resulted_at IS NULL)
+            RETURNING m.id`,
+          [ids],
+        )
+      ).rows.map((r) => r.id);
+      await this.recompute(c, events, 'system:results', at);
+      return settled;
+    });
+  }
+
+  /** FR-SPD-005: voids a market (for example a cancelled event). Bets on it are voided through settlement. */
+  voidMarket(marketId: string, ctx: TraderContext): Promise<void> {
+    return this.traderAction(ctx, 'VOID_MARKET', 'market', marketId, async (c) => {
+      const eventId = await this.eventOf(c, 'market', marketId);
+      await this.lockEvent(c, eventId);
+      const m = (
+        await c.query<{ state: MarketState; suspended_by: string | null }>(
+          'SELECT state, suspended_by FROM markets WHERE id = $1 FOR UPDATE',
+          [marketId],
+        )
+      ).rows[0]!;
+      assertTransition(m.state, 'VOIDED');
+      await c.query("UPDATE markets SET state = 'VOIDED', suspended_by = NULL WHERE id = $1", [marketId]);
+      return { before: { state: m.state }, after: { state: 'VOIDED' }, eventId, result: undefined };
     });
   }
 

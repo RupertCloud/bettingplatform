@@ -50,6 +50,12 @@ const resetRequestBody = z.object({ email: z.string().max(254) }).strict();
 const resetConfirmBody = z.object({ token, newPassword: password }).strict();
 const emailVerifyBody = z.object({ token }).strict();
 const codeBody = z.object({ code }).strict();
+const passwordBody = z.object({ password: z.string().min(1).max(256) }).strict();
+const disableMfaBody = z.object({ password: z.string().min(1).max(256), code }).strict();
+const kycBody = z
+  .object({ level: z.enum(['NONE', 'BASIC', 'FULL', 'ENHANCED']), reason: z.string().trim().min(3).max(500) })
+  .strict();
+const reasonBody = z.object({ reason: z.string().trim().min(3).max(500) }).strict();
 const idParams = z.object({ id: uuid }).strict();
 const stateBody = z
   .object({
@@ -196,14 +202,22 @@ export const buildServer = (deps: HttpDeps): FastifyInstance => {
 
   app.post('/v1/me/mfa/enrol', async (req, reply) => {
     const { playerId } = await requirePlayer(req);
+    const body = parse(passwordBody, req.body);
     noStore(reply);
-    return identity.enrolMfa(playerId);
+    return identity.enrolMfa(playerId, body.password);
   });
 
   app.post('/v1/me/mfa/confirm', async (req, reply) => {
     const { playerId, sessionId } = await requirePlayer(req);
     const body = parse(codeBody, req.body);
     await identity.confirmMfa(playerId, sessionId, body.code);
+    return reply.status(204).send();
+  });
+
+  app.post('/v1/me/mfa/disable', async (req, reply) => {
+    const { playerId } = await requirePlayer(req);
+    const body = parse(disableMfaBody, req.body);
+    await identity.disableMfa(playerId, body.password, body.code);
     return reply.status(204).send();
   });
 
@@ -222,6 +236,22 @@ export const buildServer = (deps: HttpDeps): FastifyInstance => {
     const body = parse(stateBody, req.body);
     const status = await identity.setState(id, body.state, `staff:${staffId}`, body.reason, { ip: req.ip });
     return status;
+  });
+
+  app.patch('/v1/staff/players/:id/kyc', async (req, reply) => {
+    const staffId = await requireStaff(req, 'compliance');
+    const { id } = parse(idParams, req.params);
+    const body = parse(kycBody, req.body);
+    await identity.setKycLevel(id, body.level, `staff:${staffId}`, body.reason, { ip: req.ip });
+    return reply.status(204).send();
+  });
+
+  app.post('/v1/staff/players/:id/mfa-reset', async (req, reply) => {
+    const staffId = await requireStaff(req, 'compliance');
+    const { id } = parse(idParams, req.params);
+    const body = parse(reasonBody, req.body);
+    await identity.resetMfa(id, `staff:${staffId}`, body.reason, { ip: req.ip });
+    return reply.status(204).send();
   });
 
   return app;
