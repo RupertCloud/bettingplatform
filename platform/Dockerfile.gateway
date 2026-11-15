@@ -1,4 +1,5 @@
 # Player API gateway (services/gateway) for Cloud Run. Build from platform/:
+# The same image runs the internal ops service: node services/gateway/dist/ops-main.js
 #   docker build -f Dockerfile.gateway -t bp-gateway .
 
 FROM node:22-slim AS build

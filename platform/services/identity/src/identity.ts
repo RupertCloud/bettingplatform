@@ -20,6 +20,10 @@ export const EMAIL_TOKEN_TTL_MS = 15 * MINUTE; // FR-ACC-003
 export const MFA_CHALLENGE_TTL_MS = 5 * MINUTE;
 export const MFA_MAX_ATTEMPTS = 5;
 export const RECENT_MFA_MS = 5 * MINUTE; // FR-ACC-009 step-up window
+/** A rotated refresh token presented again within this window (two tabs refreshing at once) gets a fresh pair. */
+export const REFRESH_REUSE_GRACE_MS = 10_000;
+export const EMAIL_VERIFY_ACTOR = 'system:email-verify';
+export const RG_EXPIRY_ACTOR = 'system:rg-expiry';
 export const MIN_PASSWORD_LENGTH = 10; // SEC-AUTH-002
 
 /** SEC-AUTH-001: Argon2id, 64 MiB, 3 passes. */
@@ -191,6 +195,15 @@ export class Identity implements PlayerDirectory {
       const playerId = await consumeToken(c, token, 'EMAIL_VERIFY', now);
       if (!playerId) throw new AppError('invalid_token', 400, 'The link is invalid or has expired.');
       await c.query('UPDATE players SET email_verified_at = $2 WHERE id = $1 AND email_verified_at IS NULL', [playerId, now]);
+      // A verified address is the exit from PENDING_VERIFICATION. KYC still gates deposits and bets by kycLevel.
+      const p = await lockPlayer(c, playerId);
+      if (p.state === 'PENDING_VERIFICATION') {
+        await c.query("UPDATE players SET state = 'ACTIVE' WHERE id = $1", [playerId]);
+        await appendAudit(c, {
+          playerId, actor: EMAIL_VERIFY_ACTOR, action: 'SET_STATE', reason: 'Email address verified', ip: null, at: now,
+          before: { state: p.state, until: null }, after: { state: 'ACTIVE', until: null },
+        });
+      }
     });
   }
 
@@ -292,8 +305,15 @@ export class Identity implements PlayerDirectory {
       ).rows[0];
       if (!row || row.revoked_at) return unauthenticated();
       if (row.rotated_at) {
-        await revoke(c, 'id = $1', [row.session_id], 'refresh_token_reuse', now);
-        return unauthenticated();
+        // Two tabs refreshing with the same token: the late one gets its own pair instead of ending the session.
+        const inGrace = now.getTime() - row.rotated_at.getTime() <= REFRESH_REUSE_GRACE_MS;
+        if (!inGrace || row.expires_at <= now) {
+          await revoke(c, 'id = $1', [row.session_id], 'refresh_token_reuse', now);
+          return unauthenticated();
+        }
+        await c.query('UPDATE sessions SET last_seen_at = $2 WHERE id = $1', [row.session_id, now]);
+        const pair = await issueTokens(c, row.session_id, now);
+        return { sessionId: row.session_id, ...pair, expiresAt: row.expires_at };
       }
       if (row.expires_at <= now || row.last_seen_at.getTime() <= now.getTime() - IDLE_TIMEOUT_MS) {
         await revoke(c, 'id = $1', [row.session_id], 'expired', now);
@@ -341,10 +361,14 @@ export class Identity implements PlayerDirectory {
   // ---------- MFA (FR-ACC-008/009) ----------
 
   /** Starts TOTP enrolment. The secret is stored encrypted until confirmed. */
-  async enrolMfa(playerId: PlayerId): Promise<{ secret: string; otpauthUri: string }> {
+  async enrolMfa(playerId: PlayerId, password: string): Promise<{ secret: string; otpauthUri: string }> {
     return withTx(this.pool, async (c) => {
       const player = await lockPlayer(c, playerId);
       if (player.mfa_secret) throw new AppError('mfa_already_enrolled', 409, 'MFA is already enrolled.');
+      // Re-authentication: a stolen access token alone cannot bind a second factor to the account.
+      if (!(await argon2.verify(player.password_hash, password).catch(() => false))) {
+        throw new AppError('invalid_credentials', 401, 'The password is not correct.');
+      }
       const secret = authenticator.generateSecret(20);
       await c.query('UPDATE players SET mfa_pending = $2 WHERE id = $1', [playerId, encrypt(this.mfaKey, secret, playerId)]);
       return { secret, otpauthUri: authenticator.keyuri(player.username, this.issuer, secret) };
@@ -363,6 +387,41 @@ export class Identity implements PlayerDirectory {
       return null;
     });
     if (outcome) throw outcome;
+  }
+
+  /** Turns MFA off. Needs the password and a current code, so a stolen session alone cannot do it. */
+  async disableMfa(playerId: PlayerId, password: string, code: string): Promise<void> {
+    const now = this.now();
+    const outcome = await withTx(this.pool, async (c): Promise<AppError | null> => {
+      const player = await lockPlayer(c, playerId);
+      if (!player.mfa_secret) return new AppError('mfa_not_enrolled', 409, 'MFA is not enrolled.');
+      if (!(await argon2.verify(player.password_hash, password).catch(() => false))) {
+        return new AppError('invalid_credentials', 401, 'The password is not correct.');
+      }
+      if (!(await this.checkTotp(c, player, player.mfa_secret, code, now))) return new AppError('invalid_code', 401, 'Invalid code.');
+      await c.query('UPDATE players SET mfa_secret = NULL, mfa_pending = NULL WHERE id = $1', [playerId]);
+      await appendAudit(c, {
+        playerId, actor: `player:${playerId}`, action: 'MFA_DISABLED', reason: 'Player turned MFA off', ip: null, at: now,
+        before: { mfa: true }, after: { mfa: false },
+      });
+      return null;
+    });
+    if (outcome) throw outcome;
+  }
+
+  /** Recovery for a player who lost the device: staff clear MFA after an identity check; every session ends. */
+  async resetMfa(playerId: PlayerId, actor: string, reason: string, opts: { ip?: string } = {}): Promise<void> {
+    requireReason(actor, reason);
+    const now = this.now();
+    await withTx(this.pool, async (c) => {
+      const p = await lockPlayer(c, playerId);
+      await c.query('UPDATE players SET mfa_secret = NULL, mfa_pending = NULL WHERE id = $1', [playerId]);
+      await appendAudit(c, {
+        playerId, actor, action: 'MFA_RESET', reason, ip: opts.ip ?? null, at: now,
+        before: { mfa: p.mfa_secret !== null }, after: { mfa: false },
+      });
+      await revoke(c, 'player_id = $1', [playerId], 'mfa_reset', now);
+    });
   }
 
   /** Step-up verification on an existing session. Repeated failures end the session. */
@@ -560,7 +619,29 @@ export class Identity implements PlayerDirectory {
   async getStatus(playerId: PlayerId): Promise<PlayerStatus | null> {
     if (!UUID.test(playerId)) return null;
     const row = (await this.pool.query<PlayerRow>('SELECT * FROM players WHERE id = $1', [playerId])).rows[0];
-    return row ? toStatus(row) : null;
+    if (!row) return null;
+    if (RG_STATES.has(row.state) && row.state_until !== null && row.state_until <= this.now()) {
+      return toStatus(await this.endExpiredRestriction(playerId));
+    }
+    return toStatus(row);
+  }
+
+  /**
+   * FR-RG-004: a time-out or dated self-exclusion ends on its own at state_until, back to ACTIVE.
+   * Runs lazily on lookup, so no scheduler is needed for a player to bet again.
+   */
+  private endExpiredRestriction(playerId: PlayerId): Promise<PlayerRow> {
+    const now = this.now();
+    return withTx(this.pool, async (c) => {
+      const p = await lockPlayer(c, playerId);
+      if (!RG_STATES.has(p.state) || p.state_until === null || p.state_until > now) return p; // someone else got here first
+      await c.query("UPDATE players SET state = 'ACTIVE', state_until = NULL WHERE id = $1", [playerId]);
+      await appendAudit(c, {
+        playerId, actor: RG_EXPIRY_ACTOR, action: 'SET_STATE', reason: `${p.state} period ended`, ip: null, at: now,
+        before: { state: p.state, until: p.state_until.toISOString() }, after: { state: 'ACTIVE', until: null },
+      });
+      return { ...p, state: 'ACTIVE', state_until: null };
+    });
   }
 
   // ---------- internals ----------

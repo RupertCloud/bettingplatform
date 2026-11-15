@@ -100,7 +100,7 @@ describe('http', () => {
 
   it('FR-ACC-008 MFA enrol, confirm, then login needs the challenge via /v1/auth/mfa/verify', async () => {
     const a = await registerAndLogin();
-    const enrol = await app.inject({ method: 'POST', url: '/v1/me/mfa/enrol', headers: bearer(a.accessToken) });
+    const enrol = await app.inject({ method: 'POST', url: '/v1/me/mfa/enrol', headers: bearer(a.accessToken), payload: { password: PASSWORD } });
     expect(enrol.statusCode).toBe(200);
     const { secret } = enrol.json();
     const confirm = await app.inject({

@@ -159,6 +159,14 @@ export const NumberFix = (number: number, decimal = 10): number => {
   return Number(Number(number).toFixed(decimal));
 };
 
+/**
+ * Filter for a balance change: a debit only matches when the balance covers it, so $inc can never
+ * take a balance below zero. A null result from findOneAndUpdate then means "insufficient balance".
+ */
+const coveredBy = (amount: number) => (amount < 0 ? { balance: { $gte: -amount } } : {});
+
+const insufficient = () => new Error("Insufficient balance");
+
 export const handleBet = async ({
   req = undefined,
   userId,
@@ -184,10 +192,11 @@ export const handleBet = async ({
     const amount1 = NumberFix(amount);
     const amount2 = NumberFix(amount * (rUser.pReferal || 0.02));
     const result1: any = await Balances.findOneAndUpdate(
-      { userId: userId1, currency: ObjectId(currency) },
+      { userId: userId1, currency: ObjectId(currency), ...coveredBy(amount1) },
       { $inc: { balance: amount1 } },
       { new: true }
     );
+    if (!result1) throw insufficient();
     const result2: any = await Balances.findOneAndUpdate(
       { userId: userId2, currency: ObjectId(currency) },
       { $inc: { balance: amount2 } },
@@ -225,10 +234,11 @@ export const handleBet = async ({
     return result1;
   } else {
     const result: any = await Balances.findOneAndUpdate(
-      { userId: ObjectId(userId), currency: ObjectId(currency) },
+      { userId: ObjectId(userId), currency: ObjectId(currency), ...coveredBy(NumberFix(amount)) },
       { $inc: { balance: NumberFix(amount) } },
       { new: true }
     );
+    if (!result) throw insufficient();
     const currentBalance = NumberFix(result.balance);
     const beforeBalance = NumberFix(result.balance - amount);
     await BalanceHistories.create({
@@ -263,10 +273,11 @@ export const balanceUpdate = async ({
   type: string;
 }) => {
   const result: any = await Balances.findOneAndUpdate(
-    { _id: ObjectId(balanceId) },
+    { _id: ObjectId(balanceId), ...coveredBy(NumberFix(amount)) },
     { $inc: { balance: NumberFix(amount) } },
     { new: true }
   );
+  if (!result) throw insufficient();
   const currentBalance = NumberFix(result.balance);
   const beforeBalance = NumberFix(result.balance - amount);
   await BalanceHistories.create({

@@ -80,6 +80,27 @@ describe('account state', () => {
     expect(await errCode(h.identity.setState(playerId, 'ACTIVE', 'staff:1', 'please'))).toBe('restriction_active');
   });
 
+  it('FR-RG-004 a time-out ends by itself at its end time, so the player can bet again', async () => {
+    const { playerId } = await setup();
+    await h.activate(playerId);
+    await h.identity.setState(playerId, 'TIMED_OUT', 'rg-service', '24h time-out', { until: new Date(h.clock.t.getTime() + DAY) });
+    h.clock.advance(DAY - 1);
+    expect((await h.identity.getStatus(playerId))?.state).toBe('TIMED_OUT');
+    h.clock.advance(1);
+    const [a, b] = await Promise.all([h.identity.getStatus(playerId), h.identity.getStatus(playerId)]);
+    expect([a?.state, b?.state]).toEqual(['ACTIVE', 'ACTIVE']);
+    const rows = (await h.identity.auditTrail(playerId)).filter((r) => r.actor === 'system:rg-expiry');
+    expect(rows).toHaveLength(1);
+    expect(await h.identity.verifyAuditChain()).toBeNull();
+  });
+
+  it('FR-RG-004 a permanent self-exclusion never ends by itself', async () => {
+    const { playerId } = await setup();
+    await h.identity.setState(playerId, 'SELF_EXCLUDED', 'rg-service', 'permanent exclusion', { until: null });
+    h.clock.advance(10 * 365 * DAY);
+    expect((await h.identity.getStatus(playerId))?.state).toBe('SELF_EXCLUDED');
+  });
+
   it('SEC-AUTH-005 suspension and self-exclusion end every session', async () => {
     const { playerId, email } = await setup();
     const s = await h.identity.login(email, PASSWORD, META);

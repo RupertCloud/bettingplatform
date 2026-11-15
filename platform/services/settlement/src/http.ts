@@ -39,6 +39,9 @@ const manualBody = z.object({
 }).strict();
 
 const actionParams = z.object({ actionId: z.string().uuid() }).strict();
+const reviewParams = z.object({ reviewId: z.string().uuid() }).strict();
+const reasonBody = z.object({ reason: z.string().trim().min(3).max(500) }).strict();
+const reviewBody = z.object({ resolution: z.enum(['RETRY', 'WAIVE']), reason: z.string().trim().min(3).max(500) }).strict();
 const idempotencyKey = z.string().min(8).max(128).regex(/^[A-Za-z0-9_.:-]+$/);
 
 const requireKey = (req: FastifyRequest): string => {
@@ -138,6 +141,21 @@ export const buildServer = (deps: HttpDeps): FastifyInstance => {
     requireKey(req); // approval is idempotent per approver
     const { actionId } = actionParams.parse(req.params);
     return manualView(await settlement.approveManual(actionId, who));
+  });
+
+  app.post('/v1/settlement/manual-actions/:actionId/reject', async (req) => {
+    const who = await staff(req, 'trader');
+    const { actionId } = actionParams.parse(req.params);
+    const { reason } = reasonBody.parse(req.body);
+    return manualView(await settlement.rejectManual(actionId, who, reason));
+  });
+
+  app.post('/v1/settlement/manual-review/:reviewId/resolution', async (req) => {
+    const who = await staff(req, 'finance');
+    requireKey(req);
+    const { reviewId } = reviewParams.parse(req.params);
+    const body = reviewBody.parse(req.body);
+    return settlement.resolveReview(reviewId, body.resolution, who, body.reason);
   });
 
   app.get('/v1/settlement/manual-review', async (req) => {
